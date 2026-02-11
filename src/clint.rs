@@ -1,5 +1,6 @@
 use crate::bus::Device;
 use crate::trap::Trap;
+use std::any::Any;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -11,6 +12,13 @@ const MTIME_OFFSET: u64 = 0xBFF8;
 const MSIP_BASE: u64 = 0x0000;
 
 pub struct ClintState {
+    pub mtime: u64,
+    pub mtimecmp: Vec<u64>,
+    pub msip: Vec<u32>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ClintSnapshot {
     pub mtime: u64,
     pub mtimecmp: Vec<u64>,
     pub msip: Vec<u32>,
@@ -50,6 +58,20 @@ impl ClintState {
             *msip = if value { 1 } else { 0 };
         }
     }
+
+    pub fn snapshot(&self) -> ClintSnapshot {
+        ClintSnapshot {
+            mtime: self.mtime,
+            mtimecmp: self.mtimecmp.clone(),
+            msip: self.msip.clone(),
+        }
+    }
+
+    pub fn restore(&mut self, snap: &ClintSnapshot) {
+        self.mtime = snap.mtime;
+        self.mtimecmp = snap.mtimecmp.clone();
+        self.msip = snap.msip.clone();
+    }
 }
 
 pub struct ClintDevice {
@@ -86,7 +108,12 @@ impl Device for ClintDevice {
             if let Some(msip) = state.msip.get(index) {
                 return Ok(match size {
                     4 => *msip as u64,
-                    _ => return Err(Trap::MemoryOutOfBounds { addr, size: size as u64 }),
+                    _ => {
+                        return Err(Trap::MemoryOutOfBounds {
+                            addr,
+                            size: size as u64,
+                        })
+                    }
                 });
             }
         }
@@ -94,7 +121,12 @@ impl Device for ClintDevice {
             return Ok(match size {
                 8 => state.mtime,
                 4 => Self::read32(state.mtime, addr),
-                _ => return Err(Trap::MemoryOutOfBounds { addr, size: size as u64 }),
+                _ => {
+                    return Err(Trap::MemoryOutOfBounds {
+                        addr,
+                        size: size as u64,
+                    })
+                }
             });
         }
 
@@ -104,12 +136,20 @@ impl Device for ClintDevice {
                 return Ok(match size {
                     8 => *cmp,
                     4 => Self::read32(*cmp, addr),
-                    _ => return Err(Trap::MemoryOutOfBounds { addr, size: size as u64 }),
+                    _ => {
+                        return Err(Trap::MemoryOutOfBounds {
+                            addr,
+                            size: size as u64,
+                        })
+                    }
                 });
             }
         }
 
-        Err(Trap::MemoryOutOfBounds { addr, size: size as u64 })
+        Err(Trap::MemoryOutOfBounds {
+            addr,
+            size: size as u64,
+        })
     }
 
     fn write(&mut self, addr: u64, size: usize, value: u64) -> Result<(), Trap> {
@@ -119,7 +159,12 @@ impl Device for ClintDevice {
             if let Some(msip) = state.msip.get_mut(index) {
                 match size {
                     4 => *msip = value as u32,
-                    _ => return Err(Trap::MemoryOutOfBounds { addr, size: size as u64 }),
+                    _ => {
+                        return Err(Trap::MemoryOutOfBounds {
+                            addr,
+                            size: size as u64,
+                        })
+                    }
                 }
                 return Ok(());
             }
@@ -128,7 +173,12 @@ impl Device for ClintDevice {
             match size {
                 8 => state.mtime = value,
                 4 => state.mtime = Self::write32(state.mtime, addr, value),
-                _ => return Err(Trap::MemoryOutOfBounds { addr, size: size as u64 }),
+                _ => {
+                    return Err(Trap::MemoryOutOfBounds {
+                        addr,
+                        size: size as u64,
+                    })
+                }
             }
             return Ok(());
         }
@@ -139,12 +189,24 @@ impl Device for ClintDevice {
                 match size {
                     8 => *cmp = value,
                     4 => *cmp = Self::write32(*cmp, addr, value),
-                    _ => return Err(Trap::MemoryOutOfBounds { addr, size: size as u64 }),
+                    _ => {
+                        return Err(Trap::MemoryOutOfBounds {
+                            addr,
+                            size: size as u64,
+                        })
+                    }
                 }
                 return Ok(());
             }
         }
 
-        Err(Trap::MemoryOutOfBounds { addr, size: size as u64 })
+        Err(Trap::MemoryOutOfBounds {
+            addr,
+            size: size as u64,
+        })
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }

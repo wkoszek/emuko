@@ -52,6 +52,11 @@ pub struct CsrFile {
     regs: [u64; 4096],
 }
 
+#[derive(Clone, Debug)]
+pub struct CsrSnapshot {
+    pub regs: Vec<u64>,
+}
+
 impl CsrFile {
     pub fn new(hart_id: usize, ext_mask: u64) -> Self {
         let mut regs = [0u64; 4096];
@@ -74,6 +79,14 @@ impl CsrFile {
     pub fn write(&mut self, csr: u16, value: u64) {
         // Read-only CSR range: top two bits 11 (e.g. cycle/time/instret).
         if (csr & 0xC00) == 0xC00 {
+            return;
+        }
+        if csr == CSR_SEPC || csr == CSR_MEPC {
+            // xepc is WARL: bit 0 is always zero. If IALIGN=32 (no C
+            // extension), bit 1 is also forced to zero.
+            let has_c = ((self.regs[CSR_MISA as usize] >> 2) & 1) != 0;
+            let align_mask = if has_c { !1u64 } else { !3u64 };
+            self.regs[csr as usize] = value & align_mask;
             return;
         }
         if csr == CSR_SATP {
@@ -107,5 +120,19 @@ impl CsrFile {
         misa |= 2u64 << 62; // MXL=2 for RV64
         misa |= ext_mask;
         misa
+    }
+
+    pub fn snapshot(&self) -> CsrSnapshot {
+        CsrSnapshot {
+            regs: self.regs.to_vec(),
+        }
+    }
+
+    pub fn restore(&mut self, snap: &CsrSnapshot) -> Result<(), &'static str> {
+        if snap.regs.len() != self.regs.len() {
+            return Err("CSR file size mismatch");
+        }
+        self.regs.copy_from_slice(&snap.regs);
+        Ok(())
     }
 }

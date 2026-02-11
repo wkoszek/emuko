@@ -28,9 +28,8 @@ fn read_u32(data: &[u8], off: usize) -> Option<u32> {
 }
 
 fn read_u64(data: &[u8], off: usize) -> Option<u64> {
-    data.get(off..off + 8).map(|b| {
-        u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
-    })
+    data.get(off..off + 8)
+        .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
 }
 
 pub fn parse_pe(data: &[u8]) -> Result<PeImage, String> {

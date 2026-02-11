@@ -1,6 +1,7 @@
 use crate::bus::Device;
 use crate::plic::PlicState;
 use crate::trap::Trap;
+use std::any::Any;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -8,18 +9,27 @@ pub struct Ram {
     data: Vec<u8>,
 }
 
+#[derive(Clone, Debug)]
+pub struct RamSnapshot {
+    pub data: Vec<u8>,
+}
+
 impl Ram {
     pub fn new(size: usize) -> Self {
-        Self { data: vec![0u8; size] }
+        Self {
+            data: vec![0u8; size],
+        }
     }
 
     #[inline]
     fn check(&self, addr: u64, size: usize) -> Result<usize, Trap> {
         let addr_usize = addr as usize;
-        let end = addr_usize.checked_add(size).ok_or(Trap::MemoryOutOfBounds {
-            addr,
-            size: size as u64,
-        })?;
+        let end = addr_usize
+            .checked_add(size)
+            .ok_or(Trap::MemoryOutOfBounds {
+                addr,
+                size: size as u64,
+            })?;
         if end > self.data.len() {
             return Err(Trap::MemoryOutOfBounds {
                 addr,
@@ -27,6 +37,20 @@ impl Ram {
             });
         }
         Ok(addr_usize)
+    }
+
+    pub fn snapshot(&self) -> RamSnapshot {
+        RamSnapshot {
+            data: self.data.clone(),
+        }
+    }
+
+    pub fn restore(&mut self, snap: &RamSnapshot) -> Result<(), &'static str> {
+        if self.data.len() != snap.data.len() {
+            return Err("RAM size mismatch");
+        }
+        self.data.copy_from_slice(&snap.data);
+        Ok(())
     }
 }
 
@@ -100,6 +124,10 @@ impl Device for Ram {
         }
         Ok(())
     }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
 }
 
 pub struct Uart16550 {
@@ -107,6 +135,13 @@ pub struct Uart16550 {
     irq: Option<(Rc<RefCell<PlicState>>, usize)>,
     color_enabled: bool,
     color_active: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct UartSnapshot {
+    pub ier: u8,
+    pub color_enabled: bool,
+    pub color_active: bool,
 }
 
 impl Uart16550 {
@@ -132,12 +167,29 @@ impl Uart16550 {
             plic.borrow_mut().set_pending(*irq, pending);
         }
     }
+
+    pub fn snapshot(&self) -> UartSnapshot {
+        UartSnapshot {
+            ier: self.ier,
+            color_enabled: self.color_enabled,
+            color_active: self.color_active,
+        }
+    }
+
+    pub fn restore(&mut self, snap: UartSnapshot) {
+        self.ier = snap.ier;
+        self.color_enabled = snap.color_enabled;
+        self.color_active = snap.color_active;
+    }
 }
 
 impl Device for Uart16550 {
     fn read(&mut self, addr: u64, size: usize) -> Result<u64, Trap> {
         if size != 1 {
-            return Err(Trap::MemoryOutOfBounds { addr, size: size as u64 });
+            return Err(Trap::MemoryOutOfBounds {
+                addr,
+                size: size as u64,
+            });
         }
         match addr {
             1 => Ok(self.ier as u64),
@@ -148,7 +200,10 @@ impl Device for Uart16550 {
 
     fn write(&mut self, addr: u64, size: usize, value: u64) -> Result<(), Trap> {
         if size != 1 {
-            return Err(Trap::MemoryOutOfBounds { addr, size: size as u64 });
+            return Err(Trap::MemoryOutOfBounds {
+                addr,
+                size: size as u64,
+            });
         }
         match addr {
             0 => {
@@ -167,5 +222,9 @@ impl Device for Uart16550 {
             _ => {}
         }
         Ok(())
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }

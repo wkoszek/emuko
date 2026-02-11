@@ -39,6 +39,8 @@ TIMEOUT_SECS="${TIMEOUT_SECS:-30}"
 TRACE_TRAPS="${TRACE_TRAPS:-0}"
 TRACE_INSTR="${TRACE_INSTR:-0}"
 NO_DUMP="${NO_DUMP:-1}"
+SNAPSHOT_LOAD="${SNAPSHOT_LOAD:-}"
+SNAPSHOT_SAVE="${SNAPSHOT_SAVE:-}"
 
 LOAD_ARGS=()
 if command -v file >/dev/null 2>&1; then
@@ -72,6 +74,14 @@ if [[ "$NO_DUMP" == "1" ]]; then
   STEP_ARGS+=(--no-dump)
 fi
 
+SNAPSHOT_ARGS=()
+if [[ -n "$SNAPSHOT_LOAD" ]]; then
+  SNAPSHOT_ARGS+=(--load-snapshot "$SNAPSHOT_LOAD")
+fi
+if [[ -n "$SNAPSHOT_SAVE" ]]; then
+  SNAPSHOT_ARGS+=(--save-snapshot "$SNAPSHOT_SAVE")
+fi
+
 exec ${TIMEOUT_CMD[@]+"${TIMEOUT_CMD[@]}"} cargo run --release -- "$KERNEL" \
   ${LOAD_ARGS[@]+"${LOAD_ARGS[@]}"} \
   --ram-size "$RAM_SIZE" \
@@ -79,5 +89,6 @@ exec ${TIMEOUT_CMD[@]+"${TIMEOUT_CMD[@]}"} cargo run --release -- "$KERNEL" \
   --linux \
   --bootargs "$BOOTARGS" \
   ${STEP_ARGS[@]+"${STEP_ARGS[@]}"} \
+  ${SNAPSHOT_ARGS[@]+"${SNAPSHOT_ARGS[@]}"} \
   --trace-traps "$TRACE_TRAPS" \
   --trace-instr "$TRACE_INSTR"

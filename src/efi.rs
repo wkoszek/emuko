@@ -28,7 +28,10 @@ const EFI_STATUS_NOT_FOUND: u64 = EFI_STATUS_ERROR_MASK | 14;
 const EFI_MEMORY_LOADER_CODE: u32 = 1;
 const EFI_MEMORY_LOADER_DATA: u32 = 2;
 const EFI_MEMORY_BOOT_SERVICES_DATA: u32 = 4;
+const EFI_MEMORY_RUNTIME_SERVICES_CODE: u32 = 5;
 const EFI_MEMORY_CONVENTIONAL: u32 = 7;
+const EFI_MEMORY_WB: u64 = 0x0000_0000_0000_0008;
+const EFI_MEMORY_RUNTIME: u64 = 0x8000_0000_0000_0000;
 
 const EFI_LOCATE_SEARCH_ALL_HANDLES: u64 = 0;
 const EFI_LOCATE_SEARCH_BY_REGISTER_NOTIFY: u64 = 1;
@@ -61,46 +64,26 @@ const EFI_FID_LOCATE_DEVICE_PATH: u64 = 24;
 const EFI_FID_UNSUPPORTED: u64 = 0x7ff;
 
 const EFI_GUID_FDT: [u8; 16] = [
-    0xd5, 0x21, 0xb6, 0xb1,
-    0x9c, 0xf1,
-    0xa5, 0x41,
-    0x83, 0x0b, 0xd9, 0x15, 0x2c, 0x69, 0xaa, 0xe0,
+    0xd5, 0x21, 0xb6, 0xb1, 0x9c, 0xf1, 0xa5, 0x41, 0x83, 0x0b, 0xd9, 0x15, 0x2c, 0x69, 0xaa, 0xe0,
 ];
 const EFI_GUID_LOADED_IMAGE: [u8; 16] = [
-    0xa1, 0x31, 0x1b, 0x5b,
-    0x62, 0x95,
-    0xd2, 0x11,
-    0x8e, 0x3f, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b,
+    0xa1, 0x31, 0x1b, 0x5b, 0x62, 0x95, 0xd2, 0x11, 0x8e, 0x3f, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b,
 ];
 const EFI_GUID_RISCV_BOOT_PROTOCOL: [u8; 16] = [
-    0xf6, 0x0c, 0x56, 0xf4,
-    0xec, 0x40,
-    0x4a, 0x4b,
-    0xa1, 0x92, 0xbf, 0x1d, 0x57, 0xd0, 0xb1, 0x89,
+    0xec, 0x5f, 0xd1, 0xcc, 0x73, 0x6f, 0xec, 0x4e, 0x83, 0x95, 0x3e, 0x69, 0xe4, 0xb9, 0x40, 0xbf,
 ];
+// Legacy/experimental FDT protocol GUID used by earlier simulator revisions.
 const EFI_GUID_RISCV_FDT_PROTOCOL: [u8; 16] = [
-    0xec, 0x5f, 0xd1, 0xcc,
-    0x73, 0x6f,
-    0xec, 0x4e,
-    0x83, 0x95, 0x3e, 0x69, 0xe4, 0xb9, 0x40, 0xbf,
+    0xf6, 0x0c, 0x56, 0xf4, 0xec, 0x40, 0x4a, 0x4b, 0xa1, 0x92, 0xbf, 0x1d, 0x57, 0xd0, 0xb1, 0x89,
 ];
 const EFI_GUID_LOAD_FILE_PROTOCOL: [u8; 16] = [
-    0x91, 0x30, 0xec, 0x56,
-    0x4c, 0x95,
-    0xd2, 0x11,
-    0x8e, 0x3f, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b,
+    0x91, 0x30, 0xec, 0x56, 0x4c, 0x95, 0xd2, 0x11, 0x8e, 0x3f, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b,
 ];
 const EFI_GUID_LOAD_FILE2_PROTOCOL: [u8; 16] = [
-    0xc1, 0xc0, 0x06, 0x40,
-    0xb3, 0xfc,
-    0x3e, 0x40,
-    0x99, 0x6d, 0x4a, 0x6c, 0x87, 0x24, 0xe0, 0x6d,
+    0xc1, 0xc0, 0x06, 0x40, 0xb3, 0xfc, 0x3e, 0x40, 0x99, 0x6d, 0x4a, 0x6c, 0x87, 0x24, 0xe0, 0x6d,
 ];
 const LINUX_EFI_INITRD_MEDIA_GUID: [u8; 16] = [
-    0x27, 0xe4, 0x68, 0x55,
-    0xfc, 0x68,
-    0x3d, 0x4f,
-    0xac, 0x74, 0xca, 0x55, 0x52, 0x31, 0xcc, 0x68,
+    0x27, 0xe4, 0x68, 0x55, 0xfc, 0x68, 0x3d, 0x4f, 0xac, 0x74, 0xca, 0x55, 0x52, 0x31, 0xcc, 0x68,
 ];
 
 #[derive(Clone, Copy, Debug)]
@@ -155,6 +138,31 @@ pub struct EfiState {
     trace: bool,
 }
 
+#[derive(Clone, Debug)]
+pub struct EfiSnapshot {
+    pub mem_map: Vec<EfiMemDesc>,
+    pub map_key: u64,
+    pub desc_size: u64,
+    pub desc_version: u32,
+    pub alloc_bottom: u64,
+    pub alloc_top: u64,
+    pub alloc_next: u64,
+    pub pool_next: u64,
+    pub image_handle: u64,
+    pub loaded_image: u64,
+    pub initrd_handle: u64,
+    pub initrd_devpath: u64,
+    pub riscv_boot_proto: u64,
+    pub riscv_fdt_proto: u64,
+    pub load_file_proto: u64,
+    pub load_file2_proto: u64,
+    pub dtb_addr: u64,
+    pub dtb_size: u64,
+    pub initrd_addr: u64,
+    pub initrd_size: u64,
+    pub trace: bool,
+}
+
 impl EfiState {
     pub fn new(build: EfiBuild) -> Self {
         let alloc_next = align_down(build.alloc_top, 0x1000);
@@ -184,7 +192,64 @@ impl EfiState {
         }
     }
 
-    pub fn handle_ecall(&mut self, fid: u64, hart: &mut Hart, bus: &mut dyn Bus) -> Result<(), Trap> {
+    pub fn snapshot(&self) -> EfiSnapshot {
+        EfiSnapshot {
+            mem_map: self.mem_map.clone(),
+            map_key: self.map_key,
+            desc_size: self.desc_size,
+            desc_version: self.desc_version,
+            alloc_bottom: self.alloc_bottom,
+            alloc_top: self.alloc_top,
+            alloc_next: self.alloc_next,
+            pool_next: self.pool_next,
+            image_handle: self.image_handle,
+            loaded_image: self.loaded_image,
+            initrd_handle: self.initrd_handle,
+            initrd_devpath: self.initrd_devpath,
+            riscv_boot_proto: self.riscv_boot_proto,
+            riscv_fdt_proto: self.riscv_fdt_proto,
+            load_file_proto: self.load_file_proto,
+            load_file2_proto: self.load_file2_proto,
+            dtb_addr: self.dtb_addr,
+            dtb_size: self.dtb_size,
+            initrd_addr: self.initrd_addr,
+            initrd_size: self.initrd_size,
+            trace: self.trace,
+        }
+    }
+
+    pub fn from_snapshot(snap: EfiSnapshot) -> Self {
+        Self {
+            mem_map: snap.mem_map,
+            map_key: snap.map_key,
+            desc_size: snap.desc_size,
+            desc_version: snap.desc_version,
+            alloc_bottom: snap.alloc_bottom,
+            alloc_top: snap.alloc_top,
+            alloc_next: snap.alloc_next,
+            pool_next: snap.pool_next,
+            image_handle: snap.image_handle,
+            loaded_image: snap.loaded_image,
+            initrd_handle: snap.initrd_handle,
+            initrd_devpath: snap.initrd_devpath,
+            riscv_boot_proto: snap.riscv_boot_proto,
+            riscv_fdt_proto: snap.riscv_fdt_proto,
+            load_file_proto: snap.load_file_proto,
+            load_file2_proto: snap.load_file2_proto,
+            dtb_addr: snap.dtb_addr,
+            dtb_size: snap.dtb_size,
+            initrd_addr: snap.initrd_addr,
+            initrd_size: snap.initrd_size,
+            trace: snap.trace,
+        }
+    }
+
+    pub fn handle_ecall(
+        &mut self,
+        fid: u64,
+        hart: &mut Hart,
+        bus: &mut dyn Bus,
+    ) -> Result<(), Trap> {
         if self.trace {
             eprintln!(
                 "EFI call {} fid={} a0=0x{:016x} a1=0x{:016x} a2=0x{:016x} a3=0x{:016x} a4=0x{:016x}",
@@ -364,15 +429,26 @@ impl EfiState {
             write_u32(bus, desc_ver_ptr, self.desc_version)?;
         }
         if self.trace {
-            eprintln!("EFI GetMemoryMap: entries={} key={}", self.mem_map.len(), self.map_key);
+            eprintln!(
+                "EFI GetMemoryMap: entries={} key={}",
+                self.mem_map.len(),
+                self.map_key
+            );
         }
         Ok(EFI_STATUS_SUCCESS)
     }
 
-    fn handle_exit_boot_services(&mut self, hart: &mut Hart, _bus: &mut dyn Bus) -> Result<u64, Trap> {
+    fn handle_exit_boot_services(
+        &mut self,
+        hart: &mut Hart,
+        _bus: &mut dyn Bus,
+    ) -> Result<u64, Trap> {
         let map_key = hart.regs[11];
         if self.trace {
-            eprintln!("EFI ExitBootServices: key={} expected={}", map_key, self.map_key);
+            eprintln!(
+                "EFI ExitBootServices: key={} expected={}",
+                map_key, self.map_key
+            );
         }
         if map_key != self.map_key {
             return Ok(EFI_STATUS_INVALID_PARAMETER);
@@ -453,7 +529,7 @@ impl EfiState {
                 ty,
                 phys_start: start,
                 num_pages: (end - start) / 4096,
-                attr: 0,
+                attr: EFI_MEMORY_WB,
             });
         }
         next_map.sort_by_key(|d| d.phys_start);
@@ -542,7 +618,11 @@ impl EfiState {
         Ok(EFI_STATUS_SUCCESS)
     }
 
-    fn handle_conout_output_string(&mut self, hart: &mut Hart, bus: &mut dyn Bus) -> Result<u64, Trap> {
+    fn handle_conout_output_string(
+        &mut self,
+        hart: &mut Hart,
+        bus: &mut dyn Bus,
+    ) -> Result<u64, Trap> {
         let str_ptr = hart.regs[11];
         if str_ptr == 0 {
             return Ok(EFI_STATUS_INVALID_PARAMETER);
@@ -625,10 +705,14 @@ impl EfiState {
         if handle == self.image_handle && guid == EFI_GUID_RISCV_FDT_PROTOCOL {
             return Some(self.riscv_fdt_proto);
         }
-        if (handle == self.image_handle || handle == self.initrd_handle) && guid == EFI_GUID_LOAD_FILE_PROTOCOL {
+        if (handle == self.image_handle || handle == self.initrd_handle)
+            && guid == EFI_GUID_LOAD_FILE_PROTOCOL
+        {
             return Some(self.load_file_proto);
         }
-        if (handle == self.image_handle || handle == self.initrd_handle) && guid == EFI_GUID_LOAD_FILE2_PROTOCOL {
+        if (handle == self.image_handle || handle == self.initrd_handle)
+            && guid == EFI_GUID_LOAD_FILE2_PROTOCOL
+        {
             return Some(self.load_file2_proto);
         }
         if handle == self.initrd_handle && guid == EFI_GUID_DEVICE_PATH_PROTOCOL {
@@ -647,13 +731,18 @@ impl EfiState {
                 }
             }
             Some(g) => {
-                if g == EFI_GUID_LOAD_FILE_PROTOCOL || g == EFI_GUID_LOAD_FILE2_PROTOCOL || g == EFI_GUID_DEVICE_PATH_PROTOCOL {
+                if g == EFI_GUID_LOAD_FILE_PROTOCOL
+                    || g == EFI_GUID_LOAD_FILE2_PROTOCOL
+                    || g == EFI_GUID_DEVICE_PATH_PROTOCOL
+                {
                     if self.initrd_size != 0 {
                         handles.push(self.initrd_handle);
                     }
                 } else if self.protocol_interface(self.image_handle, g).is_some() {
                     handles.push(self.image_handle);
-                } else if self.initrd_size != 0 && self.protocol_interface(self.initrd_handle, g).is_some() {
+                } else if self.initrd_size != 0
+                    && self.protocol_interface(self.initrd_handle, g).is_some()
+                {
                     handles.push(self.initrd_handle);
                 }
             }
@@ -687,7 +776,11 @@ impl EfiState {
         Ok(EFI_STATUS_SUCCESS)
     }
 
-    fn handle_locate_handle_buffer(&mut self, hart: &mut Hart, bus: &mut dyn Bus) -> Result<u64, Trap> {
+    fn handle_locate_handle_buffer(
+        &mut self,
+        hart: &mut Hart,
+        bus: &mut dyn Bus,
+    ) -> Result<u64, Trap> {
         let search_type = hart.regs[10];
         let guid_ptr = hart.regs[11];
         let _search_key = hart.regs[12];
@@ -715,9 +808,15 @@ impl EfiState {
         };
         if self.trace {
             if let Some(g) = guid {
-                eprintln!("EFI LocateHandleBuffer: search_type={} guid={:02x?}", search_type, g);
+                eprintln!(
+                    "EFI LocateHandleBuffer: search_type={} guid={:02x?}",
+                    search_type, g
+                );
             } else {
-                eprintln!("EFI LocateHandleBuffer: search_type={} guid=<none>", search_type);
+                eprintln!(
+                    "EFI LocateHandleBuffer: search_type={} guid=<none>",
+                    search_type
+                );
             }
         }
         let handles = self.handles_for_protocol(guid);
@@ -788,7 +887,11 @@ impl EfiState {
         Ok(EFI_STATUS_SUCCESS)
     }
 
-    fn handle_locate_device_path(&mut self, hart: &mut Hart, bus: &mut dyn Bus) -> Result<u64, Trap> {
+    fn handle_locate_device_path(
+        &mut self,
+        hart: &mut Hart,
+        bus: &mut dyn Bus,
+    ) -> Result<u64, Trap> {
         let guid_ptr = hart.regs[10];
         let device_path_ptr_ptr = hart.regs[11];
         let handle_ptr = hart.regs[12];
@@ -828,7 +931,10 @@ impl EfiState {
         }
         let guid = read_guid(bus, guid_ptr)?;
         if self.trace {
-            eprintln!("EFI HandleProtocol: handle=0x{:016x} guid={:02x?}", handle, guid);
+            eprintln!(
+                "EFI HandleProtocol: handle=0x{:016x} guid={:02x?}",
+                handle, guid
+            );
         }
         if handle == self.image_handle && guid == EFI_GUID_LOADED_IMAGE {
             write_u64(bus, iface_ptr, self.loaded_image)?;
@@ -942,7 +1048,15 @@ pub fn build_efi_blob(
 
     write_u64_to(&mut blob, OFF_IMAGE_HANDLE, image_handle);
 
-    let vendor_utf16: [u16; 7] = [b'K' as u16, b'R' as u16, b'I' as u16, b'S' as u16, b'C' as u16, b'V' as u16, 0];
+    let vendor_utf16: [u16; 7] = [
+        b'K' as u16,
+        b'R' as u16,
+        b'I' as u16,
+        b'S' as u16,
+        b'C' as u16,
+        b'V' as u16,
+        0,
+    ];
     for (i, ch) in vendor_utf16.iter().enumerate() {
         write_u16_to(&mut blob, OFF_VENDOR_STR + (i as u64) * 2, *ch);
     }
@@ -951,7 +1065,11 @@ pub fn build_efi_blob(
     write_u8_to(&mut blob, OFF_INITRD_DEVPATH + 0, 0x04); // MEDIA_DEVICE_PATH
     write_u8_to(&mut blob, OFF_INITRD_DEVPATH + 1, 0x03); // MEDIA_VENDOR_DP
     write_u16_to(&mut blob, OFF_INITRD_DEVPATH + 2, 0x0014); // length
-    write_guid_to(&mut blob, OFF_INITRD_DEVPATH + 4, LINUX_EFI_INITRD_MEDIA_GUID);
+    write_guid_to(
+        &mut blob,
+        OFF_INITRD_DEVPATH + 4,
+        LINUX_EFI_INITRD_MEDIA_GUID,
+    );
     write_u8_to(&mut blob, OFF_INITRD_DEVPATH + 20, 0x7f); // END_DEVICE_PATH
     write_u8_to(&mut blob, OFF_INITRD_DEVPATH + 21, 0xff);
     write_u16_to(&mut blob, OFF_INITRD_DEVPATH + 22, 0x0004);
@@ -1054,7 +1172,11 @@ pub fn build_efi_blob(
 
     write_u64_to(&mut blob, OFF_RUNTIME_SERVICES, EFI_SIG_RUNTIME_SERVICES);
     write_u32_to(&mut blob, OFF_RUNTIME_SERVICES + 8, 2);
-    write_u32_to(&mut blob, OFF_RUNTIME_SERVICES + 12, EFI_RUNTIME_SERVICES_SIZE);
+    write_u32_to(
+        &mut blob,
+        OFF_RUNTIME_SERVICES + 12,
+        EFI_RUNTIME_SERVICES_SIZE,
+    );
     write_u32_to(&mut blob, OFF_RUNTIME_SERVICES + 16, 0);
     write_u32_to(&mut blob, OFF_RUNTIME_SERVICES + 20, 0);
     let mut rt_off = OFF_RUNTIME_SERVICES + EFI_TABLE_HEADER_SIZE as u64;
@@ -1084,9 +1206,12 @@ pub fn build_efi_blob(
     conout_off += 8;
     write_u64_to(&mut blob, conout_off, 0); // Mode
 
-    // RISC-V boot protocol: store GetBootHartId at both offset 0 and 8
-    // to tolerate different struct layouts used by EFI stubs.
-    write_u64_to(&mut blob, OFF_RISCV_BOOT, stub_boot_hartid);
+    // RISC-V EFI boot protocol:
+    // struct riscv_efi_boot_protocol {
+    //   u64 revision;
+    //   get_boot_hartid(...)
+    // }
+    write_u64_to(&mut blob, OFF_RISCV_BOOT, 1);
     write_u64_to(&mut blob, OFF_RISCV_BOOT + 8, stub_boot_hartid);
     // RISC-V FDT protocol: store GetFdt at both offset 0 and 8.
     write_u64_to(&mut blob, OFF_RISCV_FDT, stub_get_fdt);
@@ -1144,10 +1269,18 @@ pub fn build_efi_blob(
     write_u64_to(
         &mut blob,
         OFF_LOADED_IMAGE + 56,
-        if load_options_size != 0 { load_options } else { 0 },
+        if load_options_size != 0 {
+            load_options
+        } else {
+            0
+        },
     );
     write_u64_to(&mut blob, OFF_LOADED_IMAGE + 64, kernel_range.0);
-    write_u64_to(&mut blob, OFF_LOADED_IMAGE + 72, kernel_range.1.saturating_sub(kernel_range.0));
+    write_u64_to(
+        &mut blob,
+        OFF_LOADED_IMAGE + 72,
+        kernel_range.1.saturating_sub(kernel_range.0),
+    );
     write_u32_to(&mut blob, OFF_LOADED_IMAGE + 80, EFI_MEMORY_LOADER_CODE);
     write_u32_to(&mut blob, OFF_LOADED_IMAGE + 84, EFI_MEMORY_LOADER_DATA);
     write_u64_to(&mut blob, OFF_LOADED_IMAGE + 88, 0);
@@ -1213,7 +1346,7 @@ fn build_memory_map(
     dtb_range: Option<(u64, u64)>,
     efi_range: (u64, u64),
 ) -> Vec<EfiMemDesc> {
-    let mut reserved: Vec<(u64, u64, u32)> = Vec::new();
+    let mut reserved: Vec<(u64, u64, u32, u64)> = Vec::new();
     if let Some(mut data_start) = kernel_data_start {
         if data_start < kernel_range.0 {
             data_start = kernel_range.0;
@@ -1222,27 +1355,62 @@ fn build_memory_map(
             data_start = kernel_range.1;
         }
         if data_start > kernel_range.0 && data_start < kernel_range.1 {
-            reserved.push((kernel_range.0, data_start, EFI_MEMORY_LOADER_CODE));
-            reserved.push((data_start, kernel_range.1, EFI_MEMORY_LOADER_DATA));
+            reserved.push((
+                kernel_range.0,
+                data_start,
+                EFI_MEMORY_LOADER_CODE,
+                EFI_MEMORY_WB,
+            ));
+            reserved.push((
+                data_start,
+                kernel_range.1,
+                EFI_MEMORY_LOADER_DATA,
+                EFI_MEMORY_WB,
+            ));
         } else {
-            reserved.push((kernel_range.0, kernel_range.1, EFI_MEMORY_LOADER_CODE));
+            reserved.push((
+                kernel_range.0,
+                kernel_range.1,
+                EFI_MEMORY_LOADER_CODE,
+                EFI_MEMORY_WB,
+            ));
         }
     } else {
-        reserved.push((kernel_range.0, kernel_range.1, EFI_MEMORY_LOADER_CODE));
+        reserved.push((
+            kernel_range.0,
+            kernel_range.1,
+            EFI_MEMORY_LOADER_CODE,
+            EFI_MEMORY_WB,
+        ));
     }
     if let Some(range) = initrd_range {
-        reserved.push((range.0, range.1, EFI_MEMORY_BOOT_SERVICES_DATA));
+        reserved.push((
+            range.0,
+            range.1,
+            EFI_MEMORY_BOOT_SERVICES_DATA,
+            EFI_MEMORY_WB,
+        ));
     }
     if let Some(range) = dtb_range {
-        reserved.push((range.0, range.1, EFI_MEMORY_BOOT_SERVICES_DATA));
+        reserved.push((
+            range.0,
+            range.1,
+            EFI_MEMORY_BOOT_SERVICES_DATA,
+            EFI_MEMORY_WB,
+        ));
     }
-    reserved.push((efi_range.0, efi_range.1, EFI_MEMORY_BOOT_SERVICES_DATA));
+    reserved.push((
+        efi_range.0,
+        efi_range.1,
+        EFI_MEMORY_RUNTIME_SERVICES_CODE,
+        EFI_MEMORY_WB | EFI_MEMORY_RUNTIME,
+    ));
     reserved.sort_by_key(|r| r.0);
 
     let mut entries = Vec::new();
     let ram_end = ram_base + ram_size;
     let mut cursor = ram_base;
-    for (start, end, ty) in reserved {
+    for (start, end, ty, attr) in reserved {
         let start = align_down(start, 0x1000);
         let end = align_up(end, 0x1000);
         if start > cursor {
@@ -1250,7 +1418,7 @@ fn build_memory_map(
                 ty: EFI_MEMORY_CONVENTIONAL,
                 phys_start: cursor,
                 num_pages: (start - cursor) / 4096,
-                attr: 0,
+                attr: EFI_MEMORY_WB,
             });
         }
         if end > start {
@@ -1258,7 +1426,7 @@ fn build_memory_map(
                 ty,
                 phys_start: start,
                 num_pages: (end - start) / 4096,
-                attr: 0,
+                attr,
             });
         }
         cursor = end.max(cursor);
@@ -1268,7 +1436,7 @@ fn build_memory_map(
             ty: EFI_MEMORY_CONVENTIONAL,
             phys_start: cursor,
             num_pages: (ram_end - cursor) / 4096,
-            attr: 0,
+            attr: EFI_MEMORY_WB,
         });
     }
     entries
@@ -1405,8 +1573,5 @@ fn read_guid(bus: &mut dyn Bus, addr: u64) -> Result<[u8; 16], Trap> {
     Ok(guid)
 }
 const EFI_GUID_DEVICE_PATH_PROTOCOL: [u8; 16] = [
-    0x91, 0x6e, 0x57, 0x09,
-    0x3f, 0x6d,
-    0xd2, 0x11,
-    0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b,
+    0x91, 0x6e, 0x57, 0x09, 0x3f, 0x6d, 0xd2, 0x11, 0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b,
 ];

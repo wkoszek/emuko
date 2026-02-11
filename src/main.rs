@@ -1,27 +1,28 @@
 mod bus;
 mod clint;
+mod csr;
 mod dev;
 mod disas;
 mod efi;
 mod fdt;
 mod hart;
-mod csr;
 mod isa;
 mod pe;
-mod sbi;
 mod plic;
+mod sbi;
+mod snapshot;
 mod system;
 mod trap;
 
-use system::{System, DEFAULT_RAM_BASE, DEFAULT_RAM_SIZE};
 use crate::bus::Bus;
-use trap::Trap;
 use std::env;
 use std::fs;
+use system::{System, DEFAULT_RAM_BASE, DEFAULT_RAM_SIZE};
+use trap::Trap;
 
 fn print_usage() {
     eprintln!(
-        "Usage: riscv_sim <binary> [--steps N] [--load-addr ADDR] [--entry-addr ADDR] [--ram-base ADDR] [--ram-size BYTES] [--dtb FILE] [--dtb-addr ADDR] [--initrd FILE] [--initrd-addr ADDR] [--linux] [--ext EXT] [--bootargs STR] [--trace-traps N] [--trace-instr N] [--no-dump]"
+        "Usage: riscv_sim <binary> [--steps N] [--load-addr ADDR] [--entry-addr ADDR] [--ram-base ADDR] [--ram-size BYTES] [--dtb FILE] [--dtb-addr ADDR] [--initrd FILE] [--initrd-addr ADDR] [--linux] [--ext EXT] [--bootargs STR] [--trace-traps N] [--trace-instr N] [--save-snapshot FILE] [--load-snapshot FILE] [--no-dump]"
     );
 }
 
@@ -109,6 +110,8 @@ fn main() {
     let mut bootargs: Option<String> = None;
     let mut trace_traps: Option<u64> = None;
     let mut trace_instr: Option<u64> = None;
+    let mut save_snapshot: Option<String> = None;
+    let mut load_snapshot: Option<String> = None;
     let mut dump_state = true;
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -250,6 +253,20 @@ fn main() {
                     std::process::exit(1);
                 }
             }
+            "--save-snapshot" => {
+                let Some(val) = args.next() else {
+                    eprintln!("Missing value for --save-snapshot");
+                    std::process::exit(1);
+                };
+                save_snapshot = Some(val);
+            }
+            "--load-snapshot" => {
+                let Some(val) = args.next() else {
+                    eprintln!("Missing value for --load-snapshot");
+                    std::process::exit(1);
+                };
+                load_snapshot = Some(val);
+            }
             "--no-dump" => {
                 dump_state = false;
             }
@@ -259,6 +276,90 @@ fn main() {
                 std::process::exit(1);
             }
         }
+    }
+
+    if let Some(load_path) = load_snapshot.as_deref() {
+        let mut system = match System::load_snapshot(load_path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Failed to load snapshot {}: {}", load_path, e);
+                std::process::exit(1);
+            }
+        };
+        if trace_traps.is_some() {
+            system.set_trace_traps(trace_traps);
+        }
+        if trace_instr.is_some() {
+            system.set_trace_instr(trace_instr);
+        }
+        let mut exit_code = 0;
+        let result = system.run(max_steps);
+        let ran = true;
+        match result {
+            Ok(steps) => {
+                println!("Completed {} steps (total {})", steps, system.total_steps());
+            }
+            Err(trap) => {
+                exit_code = 2;
+                match trap {
+                    Trap::Ecall => println!("ECALL"),
+                    Trap::Ebreak => println!("EBREAK"),
+                    Trap::IllegalInstruction(instr) => {
+                        eprintln!("Illegal instruction 0x{:08x}", instr)
+                    }
+                    Trap::MisalignedAccess { addr, size } => {
+                        eprintln!("Misaligned access addr=0x{:016x} size={}", addr, size)
+                    }
+                    Trap::MemoryOutOfBounds { addr, size } => {
+                        eprintln!("Out of bounds addr=0x{:016x} size={}", addr, size)
+                    }
+                    Trap::PageFault { addr, .. } => {
+                        eprintln!("Page fault addr=0x{:016x}", addr)
+                    }
+                }
+            }
+        }
+        if let Some(save_path) = save_snapshot.as_deref() {
+            if let Err(e) = system.save_snapshot(save_path) {
+                eprintln!("Failed to save snapshot {}: {}", save_path, e);
+                if exit_code == 0 {
+                    exit_code = 1;
+                }
+            } else {
+                println!("Saved snapshot {}", save_path);
+            }
+        }
+        if dump_state {
+            if ran {
+                system.dump_state(0);
+                system.dump_bus_stats();
+                system.dump_sbi_stats();
+                system.dump_hotpcs();
+            } else {
+                system.dump_state(0);
+                system.dump_bus_stats();
+                system.dump_sbi_stats();
+                system.dump_hotpcs();
+            }
+        } else if ran {
+            if let Some(hart0) = system.harts.get(0) {
+                println!(
+                    "final hart0: pc=0x{:016x} ra=0x{:016x} sp=0x{:016x} a0=0x{:016x} a1=0x{:016x} a2=0x{:016x} a6=0x{:016x} a7=0x{:016x}",
+                    hart0.pc,
+                    hart0.regs[1],
+                    hart0.regs[2],
+                    hart0.regs[10],
+                    hart0.regs[11],
+                    hart0.regs[12],
+                    hart0.regs[16],
+                    hart0.regs[17]
+                );
+            }
+            system.dump_bus_stats();
+            system.dump_sbi_stats();
+            system.dump_hotpcs();
+        }
+        std::process::exit(exit_code);
     }
 
     let data = match fs::read(&path) {
@@ -271,11 +372,16 @@ fn main() {
 
     let pe_image = pe::parse_pe(&data).ok();
     if pe_image.is_none() && data.len() > ram_size {
-        eprintln!("Program too large: {} bytes (ram {} bytes)", data.len(), ram_size);
+        eprintln!(
+            "Program too large: {} bytes (ram {} bytes)",
+            data.len(),
+            ram_size
+        );
         std::process::exit(1);
     }
 
-    let default_ext = (1u64 << 8) | (1u64 << 12) | (1u64 << 0) | (1u64 << 2) | (1u64 << 18) | (1u64 << 20);
+    let default_ext =
+        (1u64 << 8) | (1u64 << 12) | (1u64 << 0) | (1u64 << 2) | (1u64 << 18) | (1u64 << 20);
     let ext_mask = ext_mask.unwrap_or(default_ext);
     let mut system = System::new(1, ram_base, ram_size, ext_mask);
     system.set_trace_traps(trace_traps);
@@ -294,7 +400,11 @@ fn main() {
                 pe.sections.len()
             );
         }
-        let preferred = if pe.image_base == 0 { ram_base } else { pe.image_base };
+        let preferred = if pe.image_base == 0 {
+            ram_base
+        } else {
+            pe.image_base
+        };
         load_addr = load_addr_arg.unwrap_or(preferred);
         image_size = pe.size_of_image as u64;
         entry_addr_default = load_addr + pe.entry_rva as u64;
@@ -302,8 +412,7 @@ fn main() {
     if load_addr < ram_base || load_addr + image_size > ram_base + ram_size as u64 {
         eprintln!(
             "Image does not fit in RAM at 0x{:016x} (size 0x{:x})",
-            load_addr,
-            image_size
+            load_addr, image_size
         );
         std::process::exit(1);
     }
@@ -333,8 +442,7 @@ fn main() {
         if load_addr != pe.image_base && pe.base_reloc_size == 0 {
             eprintln!(
                 "Warning: PE has no relocations; load_addr 0x{:x} differs from image base 0x{:x}",
-                load_addr,
-                pe.image_base
+                load_addr, pe.image_base
             );
         }
         for sec in &pe.sections {
@@ -357,7 +465,9 @@ fn main() {
                 let mut offset = 0usize;
                 while offset < zero_len {
                     let chunk = (zero_len - offset).min(zeros.len());
-                    if let Err(e) = system.load(vaddr + sec.raw_size as u64 + offset as u64, &zeros[..chunk]) {
+                    if let Err(e) =
+                        system.load(vaddr + sec.raw_size as u64 + offset as u64, &zeros[..chunk])
+                    {
                         eprintln!("PE BSS load failed: {:?}", e);
                         load_ok = false;
                         break;
@@ -420,17 +530,31 @@ fn main() {
                         let reloc_addr = load_addr + page_rva as u64 + roff;
                         match rtype {
                             0xA => {
-                                if let Ok(val) = system.bus.read_u64(0, reloc_addr, crate::bus::AccessType::Debug) {
-                                    let _ = system
-                                        .bus
-                                        .write_u64(0, reloc_addr, val.wrapping_add(delta), crate::bus::AccessType::Debug);
+                                if let Ok(val) = system.bus.read_u64(
+                                    0,
+                                    reloc_addr,
+                                    crate::bus::AccessType::Debug,
+                                ) {
+                                    let _ = system.bus.write_u64(
+                                        0,
+                                        reloc_addr,
+                                        val.wrapping_add(delta),
+                                        crate::bus::AccessType::Debug,
+                                    );
                                 }
                             }
                             0x3 => {
-                                if let Ok(val) = system.bus.read_u32(0, reloc_addr, crate::bus::AccessType::Debug) {
-                                    let _ = system
-                                        .bus
-                                        .write_u32(0, reloc_addr, val.wrapping_add(delta as u32), crate::bus::AccessType::Debug);
+                                if let Ok(val) = system.bus.read_u32(
+                                    0,
+                                    reloc_addr,
+                                    crate::bus::AccessType::Debug,
+                                ) {
+                                    let _ = system.bus.write_u32(
+                                        0,
+                                        reloc_addr,
+                                        val.wrapping_add(delta as u32),
+                                        crate::bus::AccessType::Debug,
+                                    );
                                 }
                             }
                             _ => {}
@@ -457,7 +581,8 @@ fn main() {
         if let Some(initrd) = &initrd_data {
             let top = ram_base + ram_size as u64;
             let size = align_up(initrd.len() as u64, 0x1000);
-            let desired = initrd_addr.unwrap_or_else(|| align_down(top.saturating_sub(size), 0x1000));
+            let desired =
+                initrd_addr.unwrap_or_else(|| align_down(top.saturating_sub(size), 0x1000));
             let end = desired + initrd.len() as u64;
             if desired < ram_base || end > ram_base + ram_size as u64 {
                 eprintln!("Initrd does not fit in RAM at 0x{:016x}", desired);
@@ -508,7 +633,9 @@ fn main() {
         let mut dtb_load_addr = 0u64;
         if let Some(dtb) = &dtb_data {
             let desired = dtb_addr.unwrap_or_else(|| {
-                let top = initrd_range.map(|(start, _)| start).unwrap_or(ram_base + ram_size as u64);
+                let top = initrd_range
+                    .map(|(start, _)| start)
+                    .unwrap_or(ram_base + ram_size as u64);
                 let size = align_up(dtb.len() as u64, 0x1000);
                 align_down(top.saturating_sub(size), 0x1000)
             });
@@ -627,7 +754,7 @@ fn main() {
         ran = true;
         match result {
             Ok(steps) => {
-                println!("Completed {} steps", steps);
+                println!("Completed {} steps (total {})", steps, system.total_steps());
             }
             Err(trap) => {
                 exit_code = 2;
@@ -651,6 +778,17 @@ fn main() {
         }
     } else {
         exit_code = 1;
+    }
+
+    if let Some(save_path) = save_snapshot.as_deref() {
+        if let Err(e) = system.save_snapshot(save_path) {
+            eprintln!("Failed to save snapshot {}: {}", save_path, e);
+            if exit_code == 0 {
+                exit_code = 1;
+            }
+        } else {
+            println!("Saved snapshot {}", save_path);
+        }
     }
 
     if dump_state {

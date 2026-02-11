@@ -1,10 +1,11 @@
 use crate::bus::{AccessType, Bus, Interconnect};
 use crate::clint::{ClintDevice, ClintState, CLINT_BASE, CLINT_SIZE};
 use crate::dev::{Ram, Uart16550};
+use crate::efi::EfiState;
 use crate::hart::Hart;
 use crate::plic::{PlicDevice, PlicState, PLIC_BASE, PLIC_SIZE};
 use crate::sbi::{Sbi, VirtualSbi};
-use crate::efi::EfiState;
+use crate::snapshot::{self, MachineSnapshot};
 use crate::trap::Trap;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -31,12 +32,18 @@ pub struct System {
     ram_size: usize,
     reset_pc: u64,
     trace_traps: Option<u64>,
+    total_steps: u64,
 }
 
 impl System {
     pub fn new(num_harts: usize, ram_base: u64, ram_size: usize, misa_ext: u64) -> Self {
         let mut bus = Interconnect::new(num_harts);
-        bus.add_device("ram", ram_base, ram_size as u64, Box::new(Ram::new(ram_size)));
+        bus.add_device(
+            "ram",
+            ram_base,
+            ram_size as u64,
+            Box::new(Ram::new(ram_size)),
+        );
         let clint_state = Rc::new(RefCell::new(ClintState::new(num_harts)));
         bus.add_device(
             "clint",
@@ -70,6 +77,7 @@ impl System {
             ram_size,
             reset_pc: ram_base,
             trace_traps: None,
+            total_steps: 0,
         }
     }
 
@@ -98,7 +106,12 @@ impl System {
         }
     }
 
-    pub fn configure_efi_boot(&mut self, system_table: u64, image_handle: u64, efi_state: EfiState) {
+    pub fn configure_efi_boot(
+        &mut self,
+        system_table: u64,
+        image_handle: u64,
+        efi_state: EfiState,
+    ) {
         self.sbi.configure_efi(efi_state);
         for hart in &mut self.harts {
             hart.regs[10] = image_handle; // a0: image handle
@@ -124,6 +137,7 @@ impl System {
             hart.reset(self.reset_pc, sp, gp);
         }
         self.bus.stats_mut().reset();
+        self.total_steps = 0;
     }
 
     pub fn load(&mut self, addr: u64, data: &[u8]) -> Result<(), Trap> {
@@ -141,7 +155,8 @@ impl System {
             });
         }
         for (i, byte) in data.iter().enumerate() {
-            self.bus.write_u8(0, addr + i as u64, *byte, AccessType::Debug)?;
+            self.bus
+                .write_u8(0, addr + i as u64, *byte, AccessType::Debug)?;
         }
         Ok(())
     }
@@ -175,10 +190,7 @@ impl System {
                             }
                             eprintln!(
                                 "  regs a0=0x{:016x} a1=0x{:016x} a2=0x{:016x} a3=0x{:016x}",
-                                hart.regs[10],
-                                hart.regs[11],
-                                hart.regs[12],
-                                hart.regs[13]
+                                hart.regs[10], hart.regs[11], hart.regs[12], hart.regs[13]
                             );
                             eprintln!(
                                 "  satp=0x{:016x} sstatus=0x{:016x} sepc=0x{:016x} scause=0x{:016x} stval=0x{:016x}",
@@ -218,13 +230,91 @@ impl System {
                     }
                     hart.csrs.write(crate::csr::CSR_SIP, sip);
                 }
+                steps += 1;
+                self.total_steps = self.total_steps.wrapping_add(1);
                 if self.sbi.shutdown_requested() {
                     return Ok(steps);
                 }
-                steps += 1;
             }
         }
         Ok(steps)
+    }
+
+    pub fn total_steps(&self) -> u64 {
+        self.total_steps
+    }
+
+    pub fn save_snapshot(&mut self, path: &str) -> Result<(), String> {
+        let ram = self
+            .bus
+            .device_by_name_mut::<Ram>("ram")
+            .ok_or_else(|| "RAM device not found".to_string())?
+            .snapshot();
+        let uart = self
+            .bus
+            .device_by_name_mut::<Uart16550>("uart")
+            .ok_or_else(|| "UART device not found".to_string())?
+            .snapshot();
+        let clint = self.clint.borrow().snapshot();
+        let plic = self.plic.borrow().snapshot();
+        let harts = self.harts.iter().map(|h| h.snapshot()).collect();
+        let sbi = self.sbi.snapshot();
+        let bus_stats = self.bus.stats().clone();
+        let snap = MachineSnapshot {
+            ram_base: self.ram_base,
+            ram_size: self.ram_size,
+            reset_pc: self.reset_pc,
+            trace_traps: self.trace_traps,
+            total_steps: self.total_steps,
+            harts,
+            clint,
+            plic,
+            uart,
+            ram,
+            sbi,
+            bus_stats,
+        };
+        snapshot::save(path, &snap)
+    }
+
+    pub fn load_snapshot(path: &str) -> Result<Self, String> {
+        let snap = snapshot::load(path)?;
+        if snap.harts.is_empty() {
+            return Err("snapshot contains zero harts".to_string());
+        }
+        let ext = snap.harts[0].misa_ext;
+        let mut system = Self::new(snap.harts.len(), snap.ram_base, snap.ram_size, ext);
+        system.reset_pc = snap.reset_pc;
+        system.trace_traps = snap.trace_traps;
+        system.total_steps = snap.total_steps;
+        {
+            let mut clint = system.clint.borrow_mut();
+            clint.restore(&snap.clint);
+        }
+        {
+            let mut plic = system.plic.borrow_mut();
+            plic.restore(&snap.plic).map_err(|e| e.to_string())?;
+        }
+        system.harts.clear();
+        for h in &snap.harts {
+            system
+                .harts
+                .push(Hart::from_snapshot(h).map_err(|e| e.to_string())?);
+        }
+        system.sbi.restore(&snap.sbi);
+        system
+            .bus
+            .device_by_name_mut::<Ram>("ram")
+            .ok_or_else(|| "RAM device not found".to_string())?
+            .restore(&snap.ram)
+            .map_err(|e| e.to_string())?;
+        system
+            .bus
+            .device_by_name_mut::<Uart16550>("uart")
+            .ok_or_else(|| "UART device not found".to_string())?
+            .restore(snap.uart);
+        *system.bus.stats_mut() = snap.bus_stats;
+        Ok(system)
     }
 
     pub fn dump_state(&mut self, text_len: usize) {
@@ -301,11 +391,7 @@ impl System {
     fn print_stats(label: &str, counter: &crate::bus::Counter) {
         println!(
             "bus {}: fetches={} reads={} writes={} bytes={}",
-            label,
-            counter.fetches,
-            counter.reads,
-            counter.writes,
-            counter.bytes
+            label, counter.fetches, counter.reads, counter.writes, counter.bytes
         );
     }
 

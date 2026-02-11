@@ -1,8 +1,8 @@
 use crate::bus::{AccessType, Bus};
 use crate::csr::{
-    CsrFile, PrivMode, CSR_MEPC, CSR_SATP, CSR_SCAUSE, CSR_SEPC, CSR_SIP, CSR_SSTATUS, CSR_STVAL,
-    CSR_STVEC, CSR_SIE, SIP_SEIP, SIP_SSIP, SIP_STIP, SSTATUS_SIE,
-    SSTATUS_SPIE, SSTATUS_SPP,
+    CsrFile, CsrSnapshot, PrivMode, CSR_MEPC, CSR_SATP, CSR_SCAUSE, CSR_SEPC, CSR_SIE, CSR_SIP,
+    CSR_SSTATUS, CSR_STVAL, CSR_STVEC, SIP_SEIP, SIP_SSIP, SIP_STIP, SSTATUS_SIE, SSTATUS_SPIE,
+    SSTATUS_SPP,
 };
 use crate::disas;
 use crate::isa::*;
@@ -45,6 +45,24 @@ pub struct Hart {
     mmu_idmap_fallback: bool,
 }
 
+#[derive(Clone, Debug)]
+pub struct HartSnapshot {
+    pub regs: [u64; 32],
+    pub fregs: [u64; 32],
+    pub pc: u64,
+    pub hart_id: usize,
+    pub priv_mode: PrivMode,
+    pub csrs: CsrSnapshot,
+    pub misa_ext: u64,
+    pub reservation: Option<u64>,
+    pub last_access: Option<(AccessType, u64, u64)>,
+    pub trace_instr: Option<u64>,
+    pub trace_pc_left: Option<u64>,
+    pub watch_left: u64,
+    pub watch_left2: u64,
+    pub mmu_trace_left: u64,
+}
+
 impl Hart {
     pub fn new(hart_id: usize, misa_ext: u64) -> Self {
         fn parse_env_u64(name: &str) -> Option<u64> {
@@ -64,15 +82,13 @@ impl Hart {
             })
         }
 
-        let trace_pc = std::env::var("TRACE_PC")
-            .ok()
-            .and_then(|v| {
-                if let Some(hex) = v.strip_prefix("0x") {
-                    u64::from_str_radix(hex, 16).ok()
-                } else {
-                    v.parse::<u64>().ok()
-                }
-            });
+        let trace_pc = std::env::var("TRACE_PC").ok().and_then(|v| {
+            if let Some(hex) = v.strip_prefix("0x") {
+                u64::from_str_radix(hex, 16).ok()
+            } else {
+                v.parse::<u64>().ok()
+            }
+        });
         let trace_span = std::env::var("TRACE_SPAN")
             .ok()
             .and_then(|v| {
@@ -240,6 +256,52 @@ impl Hart {
         self.regs[2] = sp;
         self.regs[3] = gp;
         self.regs[4] = 0;
+    }
+
+    pub fn snapshot(&self) -> HartSnapshot {
+        HartSnapshot {
+            regs: self.regs,
+            fregs: self.fregs,
+            pc: self.pc,
+            hart_id: self.hart_id,
+            priv_mode: self.priv_mode,
+            csrs: self.csrs.snapshot(),
+            misa_ext: self.misa_ext,
+            reservation: self.reservation,
+            last_access: self.last_access,
+            trace_instr: self.trace_instr,
+            trace_pc_left: self.trace_pc_left,
+            watch_left: self.watch_left,
+            watch_left2: self.watch_left2,
+            mmu_trace_left: self.mmu_trace_left,
+        }
+    }
+
+    pub fn from_snapshot(snap: &HartSnapshot) -> Result<Self, &'static str> {
+        let mut hart = Self::new(snap.hart_id, snap.misa_ext);
+        hart.restore_from_snapshot(snap)?;
+        Ok(hart)
+    }
+
+    pub fn restore_from_snapshot(&mut self, snap: &HartSnapshot) -> Result<(), &'static str> {
+        self.regs = snap.regs;
+        self.fregs = snap.fregs;
+        self.pc = snap.pc;
+        self.hart_id = snap.hart_id;
+        self.priv_mode = snap.priv_mode;
+        self.csrs.restore(&snap.csrs)?;
+        self.misa_ext = snap.misa_ext;
+        self.reservation = snap.reservation;
+        self.last_access = snap.last_access;
+        self.trace_instr = snap.trace_instr;
+        self.trace_pc_left = snap.trace_pc_left;
+        self.watch_left = snap.watch_left;
+        self.watch_left2 = snap.watch_left2;
+        self.mmu_trace_left = snap.mmu_trace_left;
+        self.hotpc_counts.clear();
+        self.last_instrs.clear();
+        self.trace_last_dumped = false;
+        Ok(())
     }
 
     pub fn dump_hotpcs(&self) {
@@ -484,8 +546,8 @@ impl Hart {
 
     #[inline]
     fn read_u16(&mut self, bus: &mut dyn Bus, addr: u64, kind: AccessType) -> Result<u16, Trap> {
-        self.check_align(addr, 2)?;
         self.last_access = Some((kind, addr, 2));
+        self.check_align(addr, 2)?;
         let paddr = self.translate_addr(bus, addr, kind)?;
         let res = bus.read_u16(self.hart_id, paddr, kind);
         if res.is_ok() {
@@ -496,8 +558,8 @@ impl Hart {
 
     #[inline]
     fn read_u32(&mut self, bus: &mut dyn Bus, addr: u64, kind: AccessType) -> Result<u32, Trap> {
-        self.check_align(addr, 4)?;
         self.last_access = Some((kind, addr, 4));
+        self.check_align(addr, 4)?;
         let paddr = self.translate_addr(bus, addr, kind)?;
         let res = bus.read_u32(self.hart_id, paddr, kind);
         if res.is_ok() {
@@ -509,8 +571,8 @@ impl Hart {
     #[inline]
     #[allow(dead_code)]
     fn read_u64(&mut self, bus: &mut dyn Bus, addr: u64, kind: AccessType) -> Result<u64, Trap> {
-        self.check_align(addr, 8)?;
         self.last_access = Some((kind, addr, 8));
+        self.check_align(addr, 8)?;
         let paddr = self.translate_addr(bus, addr, kind)?;
         let res = bus.read_u64(self.hart_id, paddr, kind);
         if res.is_ok() {
@@ -544,8 +606,8 @@ impl Hart {
         val: u16,
         kind: AccessType,
     ) -> Result<(), Trap> {
-        self.check_align(addr, 2)?;
         self.last_access = Some((kind, addr, 2));
+        self.check_align(addr, 2)?;
         let paddr = self.translate_addr(bus, addr, kind)?;
         let res = bus.write_u16(self.hart_id, paddr, val, kind);
         if res.is_ok() {
@@ -562,8 +624,8 @@ impl Hart {
         val: u32,
         kind: AccessType,
     ) -> Result<(), Trap> {
-        self.check_align(addr, 4)?;
         self.last_access = Some((kind, addr, 4));
+        self.check_align(addr, 4)?;
         let paddr = self.translate_addr(bus, addr, kind)?;
         let res = bus.write_u32(self.hart_id, paddr, val, kind);
         if res.is_ok() {
@@ -581,8 +643,8 @@ impl Hart {
         val: u64,
         kind: AccessType,
     ) -> Result<(), Trap> {
-        self.check_align(addr, 8)?;
         self.last_access = Some((kind, addr, 8));
+        self.check_align(addr, 8)?;
         let paddr = self.translate_addr(bus, addr, kind)?;
         let res = bus.write_u64(self.hart_id, paddr, val, kind);
         if res.is_ok() {
@@ -682,10 +744,7 @@ impl Hart {
         if self.trace_pc_zero && next_pc == 0 {
             eprintln!(
                 "pc->0 via trap: pc=0x{:016x} cause=0x{:x} tval=0x{:016x} stvec=0x{:016x}",
-                self.pc,
-                cause,
-                tval,
-                stvec
+                self.pc, cause, tval, stvec
             );
         }
         self.pc = next_pc;
@@ -713,7 +772,12 @@ impl Hart {
                 self.take_trap(3, self.pc);
             }
             Trap::Ecall => {
-                self.take_trap(9, 0);
+                let cause = match self.priv_mode {
+                    PrivMode::User => 8,
+                    PrivMode::Supervisor => 9,
+                    PrivMode::Machine => 11,
+                };
+                self.take_trap(cause, 0);
             }
             Trap::PageFault { addr, kind } => {
                 let cause = match kind {
@@ -1122,7 +1186,11 @@ impl Hart {
                         }
                     }
                     (F7_MULDIV, F3_AND) => {
-                        if b == 0 { a } else { a % b }
+                        if b == 0 {
+                            a
+                        } else {
+                            a % b
+                        }
                     }
                     _ => return Err(Trap::IllegalInstruction(instr)),
                 };
@@ -1197,7 +1265,11 @@ impl Hart {
                     (F7_MULDIV, F3_AND) => {
                         let dividend = a as u32;
                         let divisor = b as u32;
-                        if divisor == 0 { dividend as i32 } else { (dividend % divisor) as i32 }
+                        if divisor == 0 {
+                            dividend as i32
+                        } else {
+                            (dividend % divisor) as i32
+                        }
                     }
                     _ => return Err(Trap::IllegalInstruction(instr)),
                 };
@@ -1210,8 +1282,12 @@ impl Hart {
                         let imm12 = (instr >> 20) & 0xfff;
                         match imm12 {
                             IMM_ECALL => {
-                                if sbi.handle_ecall(self, bus)? {
-                                    // handled by virtual SBI
+                                if self.priv_mode == PrivMode::Supervisor {
+                                    if sbi.handle_ecall(self, bus)? {
+                                        // handled by virtual SBI
+                                    } else {
+                                        return Err(Trap::Ecall);
+                                    }
                                 } else {
                                     return Err(Trap::Ecall);
                                 }
@@ -1233,7 +1309,11 @@ impl Hart {
                                 let spp = (sstatus & SSTATUS_SPP) != 0;
                                 sstatus &= !SSTATUS_SPP;
                                 self.csrs.write(CSR_SSTATUS, sstatus);
-                                self.priv_mode = if spp { PrivMode::Supervisor } else { PrivMode::User };
+                                self.priv_mode = if spp {
+                                    PrivMode::Supervisor
+                                } else {
+                                    PrivMode::User
+                                };
                                 next_pc = self.csrs.read(CSR_SEPC);
                             }
                             IMM_MRET => {
@@ -1351,13 +1431,21 @@ impl Hart {
                             }
                             F5_AMOMAX => {
                                 let old = self.read_u32(bus, addr, AccessType::Load)?;
-                                let newv = if (old as i32) > (rs2_val as i32) { old } else { rs2_val };
+                                let newv = if (old as i32) > (rs2_val as i32) {
+                                    old
+                                } else {
+                                    rs2_val
+                                };
                                 self.write_u32(bus, addr, newv, AccessType::Store)?;
                                 self.regs[rd] = (old as i32) as i64 as u64;
                             }
                             F5_AMOMIN => {
                                 let old = self.read_u32(bus, addr, AccessType::Load)?;
-                                let newv = if (old as i32) < (rs2_val as i32) { old } else { rs2_val };
+                                let newv = if (old as i32) < (rs2_val as i32) {
+                                    old
+                                } else {
+                                    rs2_val
+                                };
                                 self.write_u32(bus, addr, newv, AccessType::Store)?;
                                 self.regs[rd] = (old as i32) as i64 as u64;
                             }
@@ -1425,13 +1513,21 @@ impl Hart {
                             }
                             F5_AMOMAX => {
                                 let old = self.read_u64(bus, addr, AccessType::Load)?;
-                                let newv = if (old as i64) > (rs2_val as i64) { old } else { rs2_val };
+                                let newv = if (old as i64) > (rs2_val as i64) {
+                                    old
+                                } else {
+                                    rs2_val
+                                };
                                 self.write_u64(bus, addr, newv, AccessType::Store)?;
                                 self.regs[rd] = old;
                             }
                             F5_AMOMIN => {
                                 let old = self.read_u64(bus, addr, AccessType::Load)?;
-                                let newv = if (old as i64) < (rs2_val as i64) { old } else { rs2_val };
+                                let newv = if (old as i64) < (rs2_val as i64) {
+                                    old
+                                } else {
+                                    rs2_val
+                                };
                                 self.write_u64(bus, addr, newv, AccessType::Store)?;
                                 self.regs[rd] = old;
                             }
@@ -1467,17 +1563,13 @@ impl Hart {
         if self.trace_pc_zero && next_pc == 0 {
             eprintln!(
                 "pc->0: pc=0x{:016x} instr=0x{:08x} ra=0x{:016x}",
-                self.pc,
-                instr,
-                self.regs[1]
+                self.pc, instr, self.regs[1]
             );
         }
         if self.trace_pc_zero && next_pc == 0 {
             eprintln!(
                 "pc->0: pc=0x{:016x} instr=0x{:04x} ra=0x{:016x}",
-                self.pc,
-                instr,
-                self.regs[1]
+                self.pc, instr, self.regs[1]
             );
         }
         if watch_hit {
@@ -1698,7 +1790,9 @@ impl Hart {
                                 let subop = (instr >> 12) & 0x1;
                                 let funct2 = (instr >> 5) & 0x3;
                                 match (subop, funct2) {
-                                    (0, 0b00) => self.regs[rd] = self.regs[rd].wrapping_sub(self.regs[rs2]), // C.SUB
+                                    (0, 0b00) => {
+                                        self.regs[rd] = self.regs[rd].wrapping_sub(self.regs[rs2])
+                                    } // C.SUB
                                     (0, 0b01) => self.regs[rd] ^= self.regs[rs2], // C.XOR
                                     (0, 0b10) => self.regs[rd] |= self.regs[rs2], // C.OR
                                     (0, 0b11) => self.regs[rd] &= self.regs[rs2], // C.AND

@@ -1,5 +1,6 @@
 use crate::bus::Device;
 use crate::trap::Trap;
+use std::any::Any;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -19,6 +20,14 @@ pub struct PlicState {
     pending: [u32; PLIC_WORDS],
     enable: Vec<[u32; PLIC_WORDS]>,
     threshold: Vec<u32>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PlicSnapshot {
+    pub priority: Vec<u32>,
+    pub pending: Vec<u32>,
+    pub enable: Vec<Vec<u32>>,
+    pub threshold: Vec<u32>,
 }
 
 impl PlicState {
@@ -91,6 +100,40 @@ impl PlicState {
         }
         best_irq
     }
+
+    pub fn snapshot(&self) -> PlicSnapshot {
+        PlicSnapshot {
+            priority: self.priority.to_vec(),
+            pending: self.pending.to_vec(),
+            enable: self.enable.iter().map(|v| v.to_vec()).collect(),
+            threshold: self.threshold.clone(),
+        }
+    }
+
+    pub fn restore(&mut self, snap: &PlicSnapshot) -> Result<(), &'static str> {
+        if snap.priority.len() != self.priority.len() {
+            return Err("PLIC priority size mismatch");
+        }
+        if snap.pending.len() != self.pending.len() {
+            return Err("PLIC pending size mismatch");
+        }
+        if snap.enable.len() != self.enable.len() {
+            return Err("PLIC context count mismatch");
+        }
+        if snap.threshold.len() != self.threshold.len() {
+            return Err("PLIC threshold count mismatch");
+        }
+        for (dst, src) in self.enable.iter_mut().zip(&snap.enable) {
+            if src.len() != dst.len() {
+                return Err("PLIC enable word count mismatch");
+            }
+            dst.copy_from_slice(src);
+        }
+        self.priority.copy_from_slice(&snap.priority);
+        self.pending.copy_from_slice(&snap.pending);
+        self.threshold.copy_from_slice(&snap.threshold);
+        Ok(())
+    }
 }
 
 pub struct PlicDevice {
@@ -110,7 +153,10 @@ impl PlicDevice {
 impl Device for PlicDevice {
     fn read(&mut self, addr: u64, size: usize) -> Result<u64, Trap> {
         if size != 4 {
-            return Err(Trap::MemoryOutOfBounds { addr, size: size as u64 });
+            return Err(Trap::MemoryOutOfBounds {
+                addr,
+                size: size as u64,
+            });
         }
         let mut state = self.state.borrow_mut();
         if addr < PLIC_PENDING_BASE {
@@ -148,12 +194,18 @@ impl Device for PlicDevice {
             }
         }
 
-        Err(Trap::MemoryOutOfBounds { addr, size: size as u64 })
+        Err(Trap::MemoryOutOfBounds {
+            addr,
+            size: size as u64,
+        })
     }
 
     fn write(&mut self, addr: u64, size: usize, value: u64) -> Result<(), Trap> {
         if size != 4 {
-            return Err(Trap::MemoryOutOfBounds { addr, size: size as u64 });
+            return Err(Trap::MemoryOutOfBounds {
+                addr,
+                size: size as u64,
+            });
         }
         let mut state = self.state.borrow_mut();
         if addr < PLIC_PENDING_BASE {
@@ -191,6 +243,13 @@ impl Device for PlicDevice {
             }
         }
 
-        Err(Trap::MemoryOutOfBounds { addr, size: size as u64 })
+        Err(Trap::MemoryOutOfBounds {
+            addr,
+            size: size as u64,
+        })
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }

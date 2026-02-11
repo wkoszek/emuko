@@ -1,4 +1,5 @@
 use crate::trap::Trap;
+use std::any::Any;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccessType {
@@ -76,6 +77,7 @@ impl BusStats {
 pub trait Device {
     fn read(&mut self, addr: u64, size: usize) -> Result<u64, Trap>;
     fn write(&mut self, addr: u64, size: usize, value: u64) -> Result<(), Trap>;
+    fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
 struct DeviceRegion {
@@ -129,9 +131,9 @@ impl Interconnect {
 
     fn find_device(&self, addr: u64, size: usize) -> Option<usize> {
         let end = addr.checked_add(size as u64)?;
-        self.devices.iter().position(|dev| {
-            addr >= dev.base && end <= dev.base + dev.size
-        })
+        self.devices
+            .iter()
+            .position(|dev| addr >= dev.base && end <= dev.base + dev.size)
     }
 
     fn read(&mut self, hart: usize, addr: u64, size: usize, kind: AccessType) -> Result<u64, Trap> {
@@ -166,6 +168,11 @@ impl Interconnect {
         self.stats.record(hart, dev_idx, kind, size as u64);
         Ok(())
     }
+
+    pub fn device_by_name_mut<T: 'static>(&mut self, name: &str) -> Option<&mut T> {
+        let dev = self.devices.iter_mut().find(|d| d.name == name)?;
+        dev.dev.as_any_mut().downcast_mut::<T>()
+    }
 }
 
 #[allow(dead_code)]
@@ -175,10 +182,29 @@ pub trait Bus {
     fn read_u32(&mut self, hart: usize, addr: u64, kind: AccessType) -> Result<u32, Trap>;
     fn read_u64(&mut self, hart: usize, addr: u64, kind: AccessType) -> Result<u64, Trap>;
 
-    fn write_u8(&mut self, hart: usize, addr: u64, value: u8, kind: AccessType) -> Result<(), Trap>;
-    fn write_u16(&mut self, hart: usize, addr: u64, value: u16, kind: AccessType) -> Result<(), Trap>;
-    fn write_u32(&mut self, hart: usize, addr: u64, value: u32, kind: AccessType) -> Result<(), Trap>;
-    fn write_u64(&mut self, hart: usize, addr: u64, value: u64, kind: AccessType) -> Result<(), Trap>;
+    fn write_u8(&mut self, hart: usize, addr: u64, value: u8, kind: AccessType)
+        -> Result<(), Trap>;
+    fn write_u16(
+        &mut self,
+        hart: usize,
+        addr: u64,
+        value: u16,
+        kind: AccessType,
+    ) -> Result<(), Trap>;
+    fn write_u32(
+        &mut self,
+        hart: usize,
+        addr: u64,
+        value: u32,
+        kind: AccessType,
+    ) -> Result<(), Trap>;
+    fn write_u64(
+        &mut self,
+        hart: usize,
+        addr: u64,
+        value: u64,
+        kind: AccessType,
+    ) -> Result<(), Trap>;
 
     fn stats(&self) -> &BusStats;
     fn stats_mut(&mut self) -> &mut BusStats;
@@ -201,19 +227,43 @@ impl Bus for Interconnect {
         self.read(hart, addr, 8, kind)
     }
 
-    fn write_u8(&mut self, hart: usize, addr: u64, value: u8, kind: AccessType) -> Result<(), Trap> {
+    fn write_u8(
+        &mut self,
+        hart: usize,
+        addr: u64,
+        value: u8,
+        kind: AccessType,
+    ) -> Result<(), Trap> {
         self.write(hart, addr, 1, value as u64, kind)
     }
 
-    fn write_u16(&mut self, hart: usize, addr: u64, value: u16, kind: AccessType) -> Result<(), Trap> {
+    fn write_u16(
+        &mut self,
+        hart: usize,
+        addr: u64,
+        value: u16,
+        kind: AccessType,
+    ) -> Result<(), Trap> {
         self.write(hart, addr, 2, value as u64, kind)
     }
 
-    fn write_u32(&mut self, hart: usize, addr: u64, value: u32, kind: AccessType) -> Result<(), Trap> {
+    fn write_u32(
+        &mut self,
+        hart: usize,
+        addr: u64,
+        value: u32,
+        kind: AccessType,
+    ) -> Result<(), Trap> {
         self.write(hart, addr, 4, value as u64, kind)
     }
 
-    fn write_u64(&mut self, hart: usize, addr: u64, value: u64, kind: AccessType) -> Result<(), Trap> {
+    fn write_u64(
+        &mut self,
+        hart: usize,
+        addr: u64,
+        value: u64,
+        kind: AccessType,
+    ) -> Result<(), Trap> {
         self.write(hart, addr, 8, value, kind)
     }
 

@@ -1,13 +1,17 @@
 use crate::clint::ClintState;
-use crate::efi::{EfiState, EFI_EID};
+use crate::efi::{EfiSnapshot, EfiState, EFI_EID};
 use crate::hart::Hart;
 use crate::trap::Trap;
-use std::collections::BTreeMap;
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 pub trait Sbi {
-    fn handle_ecall(&mut self, hart: &mut Hart, bus: &mut dyn crate::bus::Bus) -> Result<bool, Trap>;
+    fn handle_ecall(
+        &mut self,
+        hart: &mut Hart,
+        bus: &mut dyn crate::bus::Bus,
+    ) -> Result<bool, Trap>;
     fn tick(&mut self, cycles: u64);
     fn time(&self) -> u64;
     fn timer_due(&self, hart_id: usize) -> bool;
@@ -25,6 +29,16 @@ pub struct VirtualSbi {
     ecall_counts: BTreeMap<(u64, u64), u64>,
 }
 
+#[derive(Clone, Debug)]
+pub struct SbiSnapshot {
+    pub shutdown: bool,
+    pub efi: Option<EfiSnapshot>,
+    pub trace: bool,
+    pub trace_efi_unsupported: bool,
+    pub force_stip: bool,
+    pub ecall_counts: Vec<(u64, u64, u64)>,
+}
+
 impl VirtualSbi {
     pub fn new(clint: Rc<RefCell<ClintState>>) -> Self {
         Self {
@@ -40,6 +54,33 @@ impl VirtualSbi {
 
     pub fn configure_efi(&mut self, efi: EfiState) {
         self.efi = Some(efi);
+    }
+
+    pub fn snapshot(&self) -> SbiSnapshot {
+        SbiSnapshot {
+            shutdown: self.shutdown,
+            efi: self.efi.as_ref().map(|e| e.snapshot()),
+            trace: self.trace,
+            trace_efi_unsupported: self.trace_efi_unsupported,
+            force_stip: self.force_stip,
+            ecall_counts: self
+                .ecall_counts
+                .iter()
+                .map(|((eid, fid), count)| (*eid, *fid, *count))
+                .collect(),
+        }
+    }
+
+    pub fn restore(&mut self, snap: &SbiSnapshot) {
+        self.shutdown = snap.shutdown;
+        self.efi = snap.efi.clone().map(EfiState::from_snapshot);
+        self.trace = snap.trace;
+        self.trace_efi_unsupported = snap.trace_efi_unsupported;
+        self.force_stip = snap.force_stip;
+        self.ecall_counts.clear();
+        for (eid, fid, count) in &snap.ecall_counts {
+            self.ecall_counts.insert((*eid, *fid), *count);
+        }
     }
 }
 
@@ -63,7 +104,11 @@ const SBI_LEGACY_SHUTDOWN: u64 = 8;
 const SBI_LEGACY_SEND_IPI: u64 = 4;
 
 impl Sbi for VirtualSbi {
-    fn handle_ecall(&mut self, hart: &mut Hart, bus: &mut dyn crate::bus::Bus) -> Result<bool, Trap> {
+    fn handle_ecall(
+        &mut self,
+        hart: &mut Hart,
+        bus: &mut dyn crate::bus::Bus,
+    ) -> Result<bool, Trap> {
         let a0 = hart.regs[10];
         let a1 = hart.regs[11];
         let a2 = hart.regs[12];

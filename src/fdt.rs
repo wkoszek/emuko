@@ -28,6 +28,9 @@ pub fn build_virt_dtb(
 
     fdt.begin_node("chosen");
     fdt.prop_str("stdout-path", "/soc/uart@10000000");
+    // Many RISC-V kernels still rely on /chosen/boot-hartid as a fallback
+    // even when booted via EFI.
+    fdt.prop_u32("boot-hartid", 0);
     if let Some(args) = bootargs {
         fdt.prop_str("bootargs", args);
     }
