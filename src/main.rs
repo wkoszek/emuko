@@ -17,13 +17,79 @@ mod trap;
 use crate::bus::Bus;
 use std::env;
 use std::fs;
+use std::path::Path;
 use system::{System, DEFAULT_RAM_BASE, DEFAULT_RAM_SIZE};
 use trap::Trap;
 
 fn print_usage() {
     eprintln!(
-        "Usage: riscv_sim <binary> [--steps N] [--load-addr ADDR] [--entry-addr ADDR] [--ram-base ADDR] [--ram-size BYTES] [--dtb FILE] [--dtb-addr ADDR] [--initrd FILE] [--initrd-addr ADDR] [--linux] [--ext EXT] [--bootargs STR] [--trace-traps N] [--trace-instr N] [--save-snapshot FILE] [--load-snapshot FILE] [--no-dump]"
+        "Usage: riscv_sim <binary> [--steps N] [--load-addr ADDR] [--entry-addr ADDR] [--ram-base ADDR] [--ram-size BYTES] [--dtb FILE] [--dtb-addr ADDR] [--initrd FILE] [--initrd-addr ADDR] [--linux] [--ext EXT] [--bootargs STR] [--trace-traps N] [--trace-instr N] [--save-snapshot FILE] [--load-snapshot FILE] [--autosnapshot-every N] [--autosnapshot-dir DIR] [--no-dump]"
     );
+}
+
+enum RunFailure {
+    Trap(Trap),
+    Snapshot(String),
+}
+
+fn print_trap(trap: Trap) {
+    match trap {
+        Trap::Ecall => println!("ECALL"),
+        Trap::Ebreak => println!("EBREAK"),
+        Trap::IllegalInstruction(instr) => {
+            eprintln!("Illegal instruction 0x{:08x}", instr)
+        }
+        Trap::MisalignedAccess { addr, size } => {
+            eprintln!("Misaligned access addr=0x{:016x} size={}", addr, size)
+        }
+        Trap::MemoryOutOfBounds { addr, size } => {
+            eprintln!("Out of bounds addr=0x{:016x} size={}", addr, size)
+        }
+        Trap::PageFault { addr, .. } => {
+            eprintln!("Page fault addr=0x{:016x}", addr)
+        }
+    }
+}
+
+fn run_with_autosnapshot(
+    system: &mut System,
+    max_steps: Option<u64>,
+    autosnapshot_every: Option<u64>,
+    autosnapshot_dir: &str,
+) -> Result<u64, RunFailure> {
+    let every = autosnapshot_every.unwrap_or(0);
+    if every == 0 {
+        return system.run(max_steps).map_err(RunFailure::Trap);
+    }
+    fs::create_dir_all(autosnapshot_dir).map_err(|e| {
+        RunFailure::Snapshot(format!("failed to create {}: {}", autosnapshot_dir, e))
+    })?;
+
+    let mut completed = 0u64;
+    loop {
+        let remaining = max_steps.map(|limit| limit.saturating_sub(completed));
+        if remaining == Some(0) {
+            return Ok(completed);
+        }
+        let chunk = remaining.map_or(every, |left| left.min(every));
+        if chunk == 0 {
+            return Ok(completed);
+        }
+        let ran = system.run(Some(chunk)).map_err(RunFailure::Trap)?;
+        completed = completed.saturating_add(ran);
+        let snap_path = format!(
+            "{}/snap-{:020}.kriscv.zst",
+            autosnapshot_dir,
+            system.total_steps()
+        );
+        system
+            .save_snapshot(&snap_path)
+            .map_err(|e| RunFailure::Snapshot(format!("failed to save {}: {}", snap_path, e)))?;
+        eprintln!("Autosaved snapshot {}", snap_path);
+        if ran < chunk {
+            return Ok(completed);
+        }
+    }
 }
 
 fn parse_u64(arg: &str) -> Option<u64> {
@@ -112,6 +178,8 @@ fn main() {
     let mut trace_instr: Option<u64> = None;
     let mut save_snapshot: Option<String> = None;
     let mut load_snapshot: Option<String> = None;
+    let mut autosnapshot_every: Option<u64> = None;
+    let mut autosnapshot_dir: String = "/tmp/korisc5".to_string();
     let mut dump_state = true;
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -267,6 +335,24 @@ fn main() {
                 };
                 load_snapshot = Some(val);
             }
+            "--autosnapshot-every" => {
+                let Some(val) = args.next() else {
+                    eprintln!("Missing value for --autosnapshot-every");
+                    std::process::exit(1);
+                };
+                autosnapshot_every = parse_u64(&val);
+                if autosnapshot_every.is_none() {
+                    eprintln!("Invalid --autosnapshot-every value: {val}");
+                    std::process::exit(1);
+                }
+            }
+            "--autosnapshot-dir" => {
+                let Some(val) = args.next() else {
+                    eprintln!("Missing value for --autosnapshot-dir");
+                    std::process::exit(1);
+                };
+                autosnapshot_dir = val;
+            }
             "--no-dump" => {
                 dump_state = false;
             }
@@ -276,6 +362,14 @@ fn main() {
                 std::process::exit(1);
             }
         }
+    }
+
+    if !Path::new(&autosnapshot_dir).is_absolute() {
+        eprintln!(
+            "--autosnapshot-dir must be an absolute path: {}",
+            autosnapshot_dir
+        );
+        std::process::exit(1);
     }
 
     if let Some(load_path) = load_snapshot.as_deref() {
@@ -293,30 +387,24 @@ fn main() {
             system.set_trace_instr(trace_instr);
         }
         let mut exit_code = 0;
-        let result = system.run(max_steps);
+        let result = run_with_autosnapshot(
+            &mut system,
+            max_steps,
+            autosnapshot_every,
+            &autosnapshot_dir,
+        );
         let ran = true;
         match result {
             Ok(steps) => {
                 println!("Completed {} steps (total {})", steps, system.total_steps());
             }
-            Err(trap) => {
+            Err(RunFailure::Trap(trap)) => {
                 exit_code = 2;
-                match trap {
-                    Trap::Ecall => println!("ECALL"),
-                    Trap::Ebreak => println!("EBREAK"),
-                    Trap::IllegalInstruction(instr) => {
-                        eprintln!("Illegal instruction 0x{:08x}", instr)
-                    }
-                    Trap::MisalignedAccess { addr, size } => {
-                        eprintln!("Misaligned access addr=0x{:016x} size={}", addr, size)
-                    }
-                    Trap::MemoryOutOfBounds { addr, size } => {
-                        eprintln!("Out of bounds addr=0x{:016x} size={}", addr, size)
-                    }
-                    Trap::PageFault { addr, .. } => {
-                        eprintln!("Page fault addr=0x{:016x}", addr)
-                    }
-                }
+                print_trap(trap);
+            }
+            Err(RunFailure::Snapshot(err)) => {
+                exit_code = 1;
+                eprintln!("{}", err);
             }
         }
         if let Some(save_path) = save_snapshot.as_deref() {
@@ -750,30 +838,24 @@ fn main() {
                 system.configure_linux_boot(dtb_load_addr);
             }
         }
-        let result = system.run(max_steps);
+        let result = run_with_autosnapshot(
+            &mut system,
+            max_steps,
+            autosnapshot_every,
+            &autosnapshot_dir,
+        );
         ran = true;
         match result {
             Ok(steps) => {
                 println!("Completed {} steps (total {})", steps, system.total_steps());
             }
-            Err(trap) => {
+            Err(RunFailure::Trap(trap)) => {
                 exit_code = 2;
-                match trap {
-                    Trap::Ecall => println!("ECALL"),
-                    Trap::Ebreak => println!("EBREAK"),
-                    Trap::IllegalInstruction(instr) => {
-                        eprintln!("Illegal instruction 0x{:08x}", instr)
-                    }
-                    Trap::MisalignedAccess { addr, size } => {
-                        eprintln!("Misaligned access addr=0x{:016x} size={}", addr, size)
-                    }
-                    Trap::MemoryOutOfBounds { addr, size } => {
-                        eprintln!("Out of bounds addr=0x{:016x} size={}", addr, size)
-                    }
-                    Trap::PageFault { addr, .. } => {
-                        eprintln!("Page fault addr=0x{:016x}", addr)
-                    }
-                }
+                print_trap(trap);
+            }
+            Err(RunFailure::Snapshot(err)) => {
+                exit_code = 1;
+                eprintln!("{}", err);
             }
         }
     } else {

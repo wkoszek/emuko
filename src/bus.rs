@@ -77,6 +77,7 @@ impl BusStats {
 pub trait Device {
     fn read(&mut self, addr: u64, size: usize) -> Result<u64, Trap>;
     fn write(&mut self, addr: u64, size: usize, value: u64) -> Result<(), Trap>;
+    fn tick(&mut self) {}
     fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
@@ -172,6 +173,12 @@ impl Interconnect {
     pub fn device_by_name_mut<T: 'static>(&mut self, name: &str) -> Option<&mut T> {
         let dev = self.devices.iter_mut().find(|d| d.name == name)?;
         dev.dev.as_any_mut().downcast_mut::<T>()
+    }
+
+    pub fn tick_devices(&mut self) {
+        for dev in &mut self.devices {
+            dev.dev.tick();
+        }
     }
 }
 

@@ -3,7 +3,11 @@ use crate::plic::PlicState;
 use crate::trap::Trap;
 use std::any::Any;
 use std::cell::RefCell;
+use std::collections::VecDeque;
+use std::io::{self, Read, Write};
 use std::rc::Rc;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
 
 pub struct Ram {
     data: Vec<u8>,
@@ -132,25 +136,88 @@ impl Device for Ram {
 
 pub struct Uart16550 {
     ier: u8,
+    lcr: u8,
+    mcr: u8,
+    fcr: u8,
+    scr: u8,
+    dll: u8,
+    dlm: u8,
+    tx_irq_pending: bool,
+    rx_irq_pending: bool,
+    rx_fifo: VecDeque<u8>,
+    input_rx: Option<Receiver<u8>>,
     irq: Option<(Rc<RefCell<PlicState>>, usize)>,
     color_enabled: bool,
     color_active: bool,
+    trace_input: bool,
+    irq_line: bool,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct UartSnapshot {
     pub ier: u8,
+    pub lcr: u8,
+    pub mcr: u8,
+    pub fcr: u8,
+    pub scr: u8,
+    pub dll: u8,
+    pub dlm: u8,
+    pub tx_irq_pending: bool,
+    pub rx_irq_pending: bool,
+    pub rx_fifo: Vec<u8>,
     pub color_enabled: bool,
     pub color_active: bool,
 }
 
+const IER_ERBFI: u8 = 1 << 0;
+const IER_ETBEI: u8 = 1 << 1;
+const LCR_DLAB: u8 = 1 << 7;
+
 impl Uart16550 {
+    fn spawn_stdin_reader() -> Receiver<u8> {
+        let (tx, rx) = mpsc::channel::<u8>();
+        thread::spawn(move || {
+            let stdin = io::stdin();
+            let mut locked = stdin.lock();
+            let mut buf = [0u8; 1];
+            loop {
+                match locked.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if tx.send(buf[0]).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        if e.kind() == io::ErrorKind::Interrupted {
+                            continue;
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+        rx
+    }
+
     pub fn with_irq(plic: Rc<RefCell<PlicState>>, irq: usize) -> Self {
         Self {
             ier: 0,
+            lcr: 0,
+            mcr: 0,
+            fcr: 0,
+            scr: 0,
+            dll: 0,
+            dlm: 0,
+            tx_irq_pending: false,
+            rx_irq_pending: false,
+            rx_fifo: VecDeque::new(),
+            input_rx: Some(Self::spawn_stdin_reader()),
             irq: Some((plic, irq)),
             color_enabled: true,
             color_active: false,
+            trace_input: std::env::var("UART_TRACE_INPUT").is_ok(),
+            irq_line: false,
         }
     }
 
@@ -160,17 +227,88 @@ impl Uart16550 {
             self.color_active = true;
         }
         print!("{}", ch as char);
+        let _ = io::stdout().flush();
     }
 
     fn set_irq(&mut self, pending: bool) {
         if let Some((plic, irq)) = &self.irq {
-            plic.borrow_mut().set_pending(*irq, pending);
+            let mut p = plic.borrow_mut();
+            if pending {
+                p.force_enable_irq_all_contexts(*irq);
+            }
+            p.set_pending(*irq, pending);
         }
+    }
+
+    fn update_irq_line(&mut self) {
+        // Be permissive on RX IRQ assertion: some guest paths rely on
+        // immediate wakeups while probing UART config, and strict IER gating
+        // can leave console input stuck with no prompt.
+        let rx = self.rx_irq_pending;
+        let tx = self.tx_irq_pending && (self.ier & IER_ETBEI) != 0;
+        let asserted = rx || tx;
+        if self.trace_input && asserted != self.irq_line {
+            let plic_state = self
+                .irq
+                .as_ref()
+                .map(|(plic, irq)| plic.borrow().source_status(0, *irq));
+            eprintln!(
+                "uart: irq_line {} (rx_pending={} tx_pending={} ier=0x{:02x} lcr=0x{:02x})",
+                if asserted { "assert" } else { "deassert" },
+                self.rx_irq_pending,
+                self.tx_irq_pending,
+                self.ier,
+                self.lcr
+            );
+            if let Some((pending, enabled, prio, threshold, deliver)) = plic_state {
+                eprintln!(
+                    "uart: plic src pending={} enabled={} prio={} threshold={} deliver={}",
+                    pending, enabled, prio, threshold, deliver
+                );
+            }
+        }
+        self.irq_line = asserted;
+        self.set_irq(asserted);
+    }
+
+    fn poll_input(&mut self) {
+        let mut disconnected = false;
+        if let Some(rx) = self.input_rx.as_ref() {
+            loop {
+                match rx.try_recv() {
+                    Ok(ch) => {
+                        self.rx_fifo.push_back(ch);
+                        self.rx_irq_pending = true;
+                        if self.trace_input {
+                            eprintln!("uart: host->rx byte=0x{:02x}", ch);
+                        }
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if disconnected {
+            self.input_rx = None;
+        }
+        self.update_irq_line();
     }
 
     pub fn snapshot(&self) -> UartSnapshot {
         UartSnapshot {
             ier: self.ier,
+            lcr: self.lcr,
+            mcr: self.mcr,
+            fcr: self.fcr,
+            scr: self.scr,
+            dll: self.dll,
+            dlm: self.dlm,
+            tx_irq_pending: self.tx_irq_pending,
+            rx_irq_pending: self.rx_irq_pending,
+            rx_fifo: self.rx_fifo.iter().copied().collect(),
             color_enabled: self.color_enabled,
             color_active: self.color_active,
         }
@@ -178,8 +316,19 @@ impl Uart16550 {
 
     pub fn restore(&mut self, snap: UartSnapshot) {
         self.ier = snap.ier;
+        self.lcr = snap.lcr;
+        self.mcr = snap.mcr;
+        self.fcr = snap.fcr;
+        self.scr = snap.scr;
+        self.dll = snap.dll;
+        self.dlm = snap.dlm;
+        self.tx_irq_pending = snap.tx_irq_pending;
+        self.rx_irq_pending = snap.rx_irq_pending;
+        self.rx_fifo = snap.rx_fifo.into_iter().collect();
         self.color_enabled = snap.color_enabled;
         self.color_active = snap.color_active;
+        self.irq_line = false;
+        self.update_irq_line();
     }
 }
 
@@ -191,11 +340,55 @@ impl Device for Uart16550 {
                 size: size as u64,
             });
         }
-        match addr {
-            1 => Ok(self.ier as u64),
-            5 => Ok(0x60), // LSR: THR empty + TEMT set.
-            _ => Ok(0),
-        }
+        self.poll_input();
+        let val = match addr {
+            0 => {
+                if (self.lcr & LCR_DLAB) != 0 {
+                    self.dll
+                } else {
+                    let v = self.rx_fifo.pop_front().unwrap_or(0);
+                    if self.rx_fifo.is_empty() {
+                        self.rx_irq_pending = false;
+                    }
+                    if self.trace_input {
+                        eprintln!("uart: guest read rbr byte=0x{:02x}", v);
+                    }
+                    v
+                }
+            }
+            1 => {
+                if (self.lcr & LCR_DLAB) != 0 {
+                    self.dlm
+                } else {
+                    self.ier
+                }
+            }
+            2 => {
+                // IIR: bit0=1 means no pending interrupt.
+                if self.rx_irq_pending && (self.ier & IER_ERBFI) != 0 {
+                    0x04
+                } else if self.tx_irq_pending && (self.ier & IER_ETBEI) != 0 {
+                    self.tx_irq_pending = false;
+                    0x02
+                } else {
+                    0x01
+                }
+            }
+            3 => self.lcr,
+            4 => self.mcr,
+            5 => {
+                let mut lsr = 0x60u8; // THR empty + TEMT
+                if !self.rx_fifo.is_empty() {
+                    lsr |= 0x01; // Data ready
+                }
+                lsr
+            }
+            6 => 0xB0, // DCD + DSR + CTS high
+            7 => self.scr,
+            _ => 0,
+        };
+        self.update_irq_line();
+        Ok(val as u64)
     }
 
     fn write(&mut self, addr: u64, size: usize, value: u64) -> Result<(), Trap> {
@@ -205,23 +398,59 @@ impl Device for Uart16550 {
                 size: size as u64,
             });
         }
+        self.poll_input();
+        let val = value as u8;
         match addr {
             0 => {
-                let ch = value as u8;
-                self.emit_char(ch);
-                if (self.ier & 0x02) != 0 {
-                    self.set_irq(true);
+                if (self.lcr & LCR_DLAB) != 0 {
+                    self.dll = val;
+                } else {
+                    self.emit_char(val);
+                    if (self.ier & IER_ETBEI) != 0 {
+                        self.tx_irq_pending = true;
+                    }
                 }
             }
             1 => {
-                self.ier = value as u8;
-                if (self.ier & 0x02) == 0 {
-                    self.set_irq(false);
+                if (self.lcr & LCR_DLAB) != 0 {
+                    self.dlm = val;
+                } else {
+                    self.ier = val;
+                    if self.trace_input {
+                        eprintln!("uart: guest write ier=0x{:02x}", self.ier);
+                    }
+                    if (self.ier & IER_ETBEI) == 0 {
+                        self.tx_irq_pending = false;
+                    }
                 }
+            }
+            2 => {
+                self.fcr = val;
+                if (val & 0x02) != 0 {
+                    self.rx_fifo.clear();
+                    self.rx_irq_pending = false;
+                }
+                if (val & 0x04) != 0 {
+                    self.tx_irq_pending = false;
+                }
+            }
+            3 => {
+                self.lcr = val;
+            }
+            4 => {
+                self.mcr = val;
+            }
+            7 => {
+                self.scr = val;
             }
             _ => {}
         }
+        self.update_irq_line();
         Ok(())
+    }
+
+    fn tick(&mut self) {
+        self.poll_input();
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {

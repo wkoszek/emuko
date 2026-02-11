@@ -75,6 +75,38 @@ impl PlicState {
         false
     }
 
+    pub fn source_status(&self, hart_id: usize, irq: usize) -> (bool, bool, u32, u32, bool) {
+        if irq == 0 || irq > PLIC_NUM_SOURCES {
+            return (false, false, 0, 0, false);
+        }
+        let ctx = Self::context_index(hart_id);
+        let threshold = *self.threshold.get(ctx).unwrap_or(&0);
+        let word = irq / 32;
+        let bit = irq % 32;
+        let pending = (self.pending[word] & (1 << bit)) != 0;
+        let enabled = self
+            .enable
+            .get(ctx)
+            .is_some_and(|e| (e[word] & (1 << bit)) != 0);
+        let prio = self.priority[irq];
+        let deliver = pending && enabled && prio > threshold;
+        (pending, enabled, prio, threshold, deliver)
+    }
+
+    pub fn force_enable_irq_all_contexts(&mut self, irq: usize) {
+        if irq == 0 || irq > PLIC_NUM_SOURCES {
+            return;
+        }
+        if self.priority[irq] == 0 {
+            self.priority[irq] = 1;
+        }
+        let word = irq / 32;
+        let bit = irq % 32;
+        for ctx in &mut self.enable {
+            ctx[word] |= 1 << bit;
+        }
+    }
+
     fn claim(&mut self, ctx: usize) -> u32 {
         let threshold = *self.threshold.get(ctx).unwrap_or(&0);
         let enables = self.enable.get(ctx);

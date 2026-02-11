@@ -175,6 +175,7 @@ impl System {
                         break;
                     }
                 }
+                self.bus.tick_devices();
                 if let Err(trap) = hart.step(&mut self.bus, &mut self.sbi) {
                     if let Some(left) = self.trace_traps.as_mut() {
                         if *left > 0 {

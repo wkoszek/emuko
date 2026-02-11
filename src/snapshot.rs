@@ -8,10 +8,10 @@ use crate::plic::PlicSnapshot;
 use crate::sbi::SbiSnapshot;
 use std::convert::TryFrom;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufWriter, Cursor, Read, Write};
 
 const MAGIC: &[u8; 8] = b"KRSVSNP1";
-const VERSION: u32 = 1;
+const VERSION: u32 = 3;
 
 #[derive(Clone, Debug)]
 pub struct MachineSnapshot {
@@ -267,7 +267,8 @@ fn read_efi<R: Read>(r: &mut BinReader<R>) -> Result<EfiSnapshot, String> {
 
 pub fn save(path: &str, snap: &MachineSnapshot) -> Result<(), String> {
     let file = File::create(path).map_err(|e| e.to_string())?;
-    let mut w = BinWriter::new(BufWriter::new(file));
+    let encoder = zstd::stream::write::Encoder::new(file, 3).map_err(|e| e.to_string())?;
+    let mut w = BinWriter::new(BufWriter::new(encoder));
     w.write_bytes(MAGIC)?;
     w.write_u32(VERSION)?;
 
@@ -340,6 +341,18 @@ pub fn save(path: &str, snap: &MachineSnapshot) -> Result<(), String> {
     }
 
     w.write_u8(snap.uart.ier)?;
+    w.write_u8(snap.uart.lcr)?;
+    w.write_u8(snap.uart.mcr)?;
+    w.write_u8(snap.uart.fcr)?;
+    w.write_u8(snap.uart.scr)?;
+    w.write_u8(snap.uart.dll)?;
+    w.write_u8(snap.uart.dlm)?;
+    w.write_bool(snap.uart.tx_irq_pending)?;
+    w.write_bool(snap.uart.rx_irq_pending)?;
+    w.write_len_u32(snap.uart.rx_fifo.len())?;
+    for b in &snap.uart.rx_fifo {
+        w.write_u8(*b)?;
+    }
     w.write_bool(snap.uart.color_enabled)?;
     w.write_bool(snap.uart.color_active)?;
 
@@ -375,19 +388,26 @@ pub fn save(path: &str, snap: &MachineSnapshot) -> Result<(), String> {
         u64::try_from(snap.ram.data.len()).map_err(|_| "ram length too large".to_string())?,
     )?;
     w.write_bytes(&snap.ram.data)?;
+    w.w.flush().map_err(|e| e.to_string())?;
+    let encoder = w.w.into_inner().map_err(|e| e.to_string())?;
+    encoder.finish().map_err(|e| e.to_string())?;
     Ok(())
 }
 
 pub fn load(path: &str) -> Result<MachineSnapshot, String> {
-    let file = File::open(path).map_err(|e| e.to_string())?;
-    let mut r = BinReader::new(BufReader::new(file));
+    let raw = std::fs::read(path).map_err(|e| e.to_string())?;
+    let bytes = match zstd::stream::decode_all(raw.as_slice()) {
+        Ok(data) => data,
+        Err(_) => raw,
+    };
+    let mut r = BinReader::new(Cursor::new(bytes));
     let mut magic = [0u8; 8];
     r.read_exact(&mut magic)?;
     if &magic != MAGIC {
         return Err("invalid snapshot magic".to_string());
     }
     let ver = r.read_u32()?;
-    if ver != VERSION {
+    if ver != 1 && ver != 2 && ver != VERSION {
         return Err(format!("unsupported snapshot version {}", ver));
     }
 
@@ -497,10 +517,50 @@ pub fn load(path: &str) -> Result<MachineSnapshot, String> {
         threshold,
     };
 
-    let uart = UartSnapshot {
-        ier: r.read_u8()?,
-        color_enabled: r.read_bool()?,
-        color_active: r.read_bool()?,
+    let uart = if ver >= 3 {
+        let ier = r.read_u8()?;
+        let lcr = r.read_u8()?;
+        let mcr = r.read_u8()?;
+        let fcr = r.read_u8()?;
+        let scr = r.read_u8()?;
+        let dll = r.read_u8()?;
+        let dlm = r.read_u8()?;
+        let tx_irq_pending = r.read_bool()?;
+        let rx_irq_pending = r.read_bool()?;
+        let rx_len = r.read_len_u32()?;
+        let mut rx_fifo = Vec::with_capacity(rx_len);
+        for _ in 0..rx_len {
+            rx_fifo.push(r.read_u8()?);
+        }
+        UartSnapshot {
+            ier,
+            lcr,
+            mcr,
+            fcr,
+            scr,
+            dll,
+            dlm,
+            tx_irq_pending,
+            rx_irq_pending,
+            rx_fifo,
+            color_enabled: r.read_bool()?,
+            color_active: r.read_bool()?,
+        }
+    } else {
+        UartSnapshot {
+            ier: r.read_u8()?,
+            lcr: 0,
+            mcr: 0,
+            fcr: 0,
+            scr: 0,
+            dll: 0,
+            dlm: 0,
+            tx_irq_pending: false,
+            rx_irq_pending: false,
+            rx_fifo: Vec::new(),
+            color_enabled: r.read_bool()?,
+            color_active: r.read_bool()?,
+        }
     };
 
     let shutdown = r.read_bool()?;

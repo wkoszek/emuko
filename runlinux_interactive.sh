@@ -14,8 +14,19 @@ if [[ -f "$DEBIAN_NETBOOT_DIR/initrd.gz" ]]; then
   DEFAULT_INITRD="$DEBIAN_NETBOOT_DIR/initrd.gz"
 fi
 
-KERNEL="${1:-$DEFAULT_KERNEL}"
-INITRD="${2:-$DEFAULT_INITRD}"
+ARGS=("$@")
+KERNEL="${DEFAULT_KERNEL}"
+INITRD="${DEFAULT_INITRD}"
+if [[ ${#ARGS[@]} -ge 1 ]]; then
+  KERNEL="${ARGS[0]}"
+fi
+if [[ ${#ARGS[@]} -ge 2 ]]; then
+  INITRD="${ARGS[1]}"
+fi
+EXTRA_SIM_ARGS=()
+if [[ ${#ARGS[@]} -ge 3 ]]; then
+  EXTRA_SIM_ARGS=("${ARGS[@]:2}")
+fi
 
 if [[ ! -f "$KERNEL" ]]; then
   echo "Missing kernel: $KERNEL" >&2
@@ -27,19 +38,23 @@ if [[ ! -f "$INITRD" ]]; then
   exit 1
 fi
 
+if [[ ! -t 0 ]]; then
+  echo "Warning: stdin is not a TTY; UART RX may not receive interactive input." >&2
+fi
+
 echo "Kernel: $KERNEL" >&2
 echo "Initrd: $INITRD" >&2
 
 LOAD_ADDR="${LOAD_ADDR:-0x80200000}"
 ENTRY_ADDR="${ENTRY_ADDR:-0x80200000}"
-BOOTARGS="${BOOTARGS:-console=ttyS0,115200 earlycon=uart8250,mmio,0x10000000}"
+BOOTARGS="${BOOTARGS:-console=ttyS0,115200 earlycon=uart8250,mmio,0x10000000 ignore_loglevel rdinit=/bin/sh}"
 RAM_MB="${RAM_MB:-1024}"
 RAM_SIZE="${RAM_SIZE:-}"
 if [[ -z "$RAM_SIZE" ]]; then
   RAM_SIZE="$((RAM_MB * 1024 * 1024))"
 fi
-STEPS="${STEPS:-200000}"
-TIMEOUT_SECS="${TIMEOUT_SECS:-30}"
+STEPS="${STEPS:-}"
+TIMEOUT_SECS="${TIMEOUT_SECS:-0}"
 TRACE_TRAPS="${TRACE_TRAPS:-0}"
 TRACE_INSTR="${TRACE_INSTR:-0}"
 NO_DUMP="${NO_DUMP:-1}"
@@ -101,4 +116,5 @@ exec ${TIMEOUT_CMD[@]+"${TIMEOUT_CMD[@]}"} cargo run --release -- "$KERNEL" \
   ${STEP_ARGS[@]+"${STEP_ARGS[@]}"} \
   ${SNAPSHOT_ARGS[@]+"${SNAPSHOT_ARGS[@]}"} \
   --trace-traps "$TRACE_TRAPS" \
-  --trace-instr "$TRACE_INSTR"
+  --trace-instr "$TRACE_INSTR" \
+  ${EXTRA_SIM_ARGS[@]+"${EXTRA_SIM_ARGS[@]}"}
