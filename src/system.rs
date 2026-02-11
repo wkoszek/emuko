@@ -1,0 +1,321 @@
+use crate::bus::{AccessType, Bus, Interconnect};
+use crate::clint::{ClintDevice, ClintState, CLINT_BASE, CLINT_SIZE};
+use crate::dev::{Ram, Uart16550};
+use crate::hart::Hart;
+use crate::plic::{PlicDevice, PlicState, PLIC_BASE, PLIC_SIZE};
+use crate::sbi::{Sbi, VirtualSbi};
+use crate::efi::EfiState;
+use crate::trap::Trap;
+use std::cell::RefCell;
+use std::rc::Rc;
+
+pub const DEFAULT_RAM_BASE: u64 = 0x8000_0000;
+pub const DEFAULT_RAM_SIZE: usize = 64 * 1024 * 1024;
+pub const UART_BASE: u64 = 0x1000_0000;
+pub const UART_SIZE: u64 = 0x100;
+
+pub const DATA_OFFSET: u64 = 0x0001_0000;
+pub const BSS_OFFSET: u64 = 0x0002_0000;
+pub const HEAP_OFFSET: u64 = 0x0003_0000;
+pub const STACK_OFFSET: u64 = 0x0008_0000;
+pub const STACK_TOP_OFFSET: u64 = 0x0010_0000;
+pub const DUMP_BYTES: usize = 256;
+
+pub struct System {
+    pub bus: Interconnect,
+    pub harts: Vec<Hart>,
+    pub sbi: VirtualSbi,
+    clint: Rc<RefCell<ClintState>>,
+    plic: Rc<RefCell<PlicState>>,
+    ram_base: u64,
+    ram_size: usize,
+    reset_pc: u64,
+    trace_traps: Option<u64>,
+}
+
+impl System {
+    pub fn new(num_harts: usize, ram_base: u64, ram_size: usize, misa_ext: u64) -> Self {
+        let mut bus = Interconnect::new(num_harts);
+        bus.add_device("ram", ram_base, ram_size as u64, Box::new(Ram::new(ram_size)));
+        let clint_state = Rc::new(RefCell::new(ClintState::new(num_harts)));
+        bus.add_device(
+            "clint",
+            CLINT_BASE,
+            CLINT_SIZE,
+            Box::new(ClintDevice::new(Rc::clone(&clint_state))),
+        );
+        let plic_state = Rc::new(RefCell::new(PlicState::new(num_harts)));
+        bus.add_device(
+            "plic",
+            PLIC_BASE,
+            PLIC_SIZE,
+            Box::new(PlicDevice::new(Rc::clone(&plic_state), num_harts)),
+        );
+        bus.add_device(
+            "uart",
+            UART_BASE,
+            UART_SIZE,
+            Box::new(Uart16550::with_irq(Rc::clone(&plic_state), 10)),
+        );
+
+        let harts = (0..num_harts).map(|id| Hart::new(id, misa_ext)).collect();
+
+        Self {
+            bus,
+            harts,
+            sbi: VirtualSbi::new(Rc::clone(&clint_state)),
+            clint: clint_state,
+            plic: plic_state,
+            ram_base,
+            ram_size,
+            reset_pc: ram_base,
+            trace_traps: None,
+        }
+    }
+
+    pub fn set_reset_pc(&mut self, pc: u64) {
+        self.reset_pc = pc;
+    }
+
+    pub fn set_trace_traps(&mut self, limit: Option<u64>) {
+        self.trace_traps = limit;
+    }
+
+    pub fn set_trace_instr(&mut self, limit: Option<u64>) {
+        for hart in &mut self.harts {
+            hart.set_trace_instr(limit);
+        }
+    }
+
+    pub fn configure_linux_boot(&mut self, dtb_addr: u64) {
+        for hart in &mut self.harts {
+            hart.regs[10] = hart.hart_id as u64; // a0: hartid
+            hart.regs[11] = dtb_addr; // a1: dtb
+            hart.regs[12] = 0;
+            hart.regs[13] = 0;
+            hart.regs[4] = hart.hart_id as u64; // tp: some boot flows expect hartid here.
+            hart.csrs.write(crate::csr::CSR_SATP, 0);
+        }
+    }
+
+    pub fn configure_efi_boot(&mut self, system_table: u64, image_handle: u64, efi_state: EfiState) {
+        self.sbi.configure_efi(efi_state);
+        for hart in &mut self.harts {
+            hart.regs[10] = image_handle; // a0: image handle
+            hart.regs[11] = system_table; // a1: system table
+            hart.regs[12] = 0;
+            hart.regs[13] = 0;
+            hart.regs[4] = hart.hart_id as u64; // tp
+            hart.csrs.write(crate::csr::CSR_SATP, 0);
+        }
+    }
+
+    pub fn reset(&mut self) {
+        let sp = self.ram_base + STACK_TOP_OFFSET;
+        let gp = self.ram_base + DATA_OFFSET;
+        self.clint.borrow_mut().mtime = 0;
+        for cmp in &mut self.clint.borrow_mut().mtimecmp {
+            *cmp = u64::MAX;
+        }
+        for msip in &mut self.clint.borrow_mut().msip {
+            *msip = 0;
+        }
+        for hart in &mut self.harts {
+            hart.reset(self.reset_pc, sp, gp);
+        }
+        self.bus.stats_mut().reset();
+    }
+
+    pub fn load(&mut self, addr: u64, data: &[u8]) -> Result<(), Trap> {
+        let end = addr
+            .checked_add(data.len() as u64)
+            .ok_or(Trap::MemoryOutOfBounds {
+                addr,
+                size: data.len() as u64,
+            })?;
+        let ram_end = self.ram_base + self.ram_size as u64;
+        if addr < self.ram_base || end > ram_end {
+            return Err(Trap::MemoryOutOfBounds {
+                addr,
+                size: data.len() as u64,
+            });
+        }
+        for (i, byte) in data.iter().enumerate() {
+            self.bus.write_u8(0, addr + i as u64, *byte, AccessType::Debug)?;
+        }
+        Ok(())
+    }
+
+    pub fn run(&mut self, max_steps: Option<u64>) -> Result<u64, Trap> {
+        let mut steps = 0u64;
+        loop {
+            if let Some(limit) = max_steps {
+                if steps >= limit {
+                    break;
+                }
+            }
+            for hart in &mut self.harts {
+                if let Some(limit) = max_steps {
+                    if steps >= limit {
+                        break;
+                    }
+                }
+                if let Err(trap) = hart.step(&mut self.bus, &mut self.sbi) {
+                    if let Some(left) = self.trace_traps.as_mut() {
+                        if *left > 0 {
+                            eprintln!(
+                                "trap hart={} pc=0x{:016x} {:?}",
+                                hart.hart_id, hart.pc, trap
+                            );
+                            if let Some((kind, addr, size)) = hart.last_access() {
+                                eprintln!(
+                                    "  last_access kind={:?} addr=0x{:016x} size={}",
+                                    kind, addr, size
+                                );
+                            }
+                            eprintln!(
+                                "  regs a0=0x{:016x} a1=0x{:016x} a2=0x{:016x} a3=0x{:016x}",
+                                hart.regs[10],
+                                hart.regs[11],
+                                hart.regs[12],
+                                hart.regs[13]
+                            );
+                            eprintln!(
+                                "  satp=0x{:016x} sstatus=0x{:016x} sepc=0x{:016x} scause=0x{:016x} stval=0x{:016x}",
+                                hart.csrs.read(crate::csr::CSR_SATP),
+                                hart.csrs.read(crate::csr::CSR_SSTATUS),
+                                hart.csrs.read(crate::csr::CSR_SEPC),
+                                hart.csrs.read(crate::csr::CSR_SCAUSE),
+                                hart.csrs.read(crate::csr::CSR_STVAL)
+                            );
+                            *left -= 1;
+                        }
+                    }
+                    hart.handle_trap(trap);
+                }
+                self.sbi.tick(1);
+                let now = self.sbi.time();
+                hart.csrs.set_time(now);
+                {
+                    let due = self.sbi.timer_due(hart.hart_id);
+                    let mut sip = hart.csrs.read(crate::csr::CSR_SIP);
+                    if due {
+                        sip |= crate::csr::SIP_STIP;
+                    } else {
+                        sip &= !crate::csr::SIP_STIP;
+                    }
+                    let ssip = self.clint.borrow().software_pending(hart.hart_id);
+                    if ssip {
+                        sip |= crate::csr::SIP_SSIP;
+                    } else {
+                        sip &= !crate::csr::SIP_SSIP;
+                    }
+                    let seip = self.plic.borrow().pending_for_hart(hart.hart_id);
+                    if seip {
+                        sip |= crate::csr::SIP_SEIP;
+                    } else {
+                        sip &= !crate::csr::SIP_SEIP;
+                    }
+                    hart.csrs.write(crate::csr::CSR_SIP, sip);
+                }
+                if self.sbi.shutdown_requested() {
+                    return Ok(steps);
+                }
+                steps += 1;
+            }
+        }
+        Ok(steps)
+    }
+
+    pub fn dump_state(&mut self, text_len: usize) {
+        if let Some(hart) = self.harts.get(0) {
+            println!("== Hart 0 Registers ==");
+            println!("pc  = 0x{:016x}", hart.pc);
+            for i in 0..32 {
+                if i % 4 == 0 {
+                    print!("x{:02}:", i);
+                }
+                print!(" 0x{:016x}", hart.regs[i]);
+                if i % 4 == 3 {
+                    println!();
+                }
+            }
+            if 32 % 4 != 0 {
+                println!();
+            }
+        }
+
+        println!("== Memory Dump ==");
+        let text_dump = text_len.min(DUMP_BYTES);
+        let text_base = self.ram_base;
+        let data_base = self.ram_base + DATA_OFFSET;
+        let bss_base = self.ram_base + BSS_OFFSET;
+        let heap_base = self.ram_base + HEAP_OFFSET;
+        let stack_base = self.ram_base + STACK_OFFSET;
+        let stack_top = self.ram_base + STACK_TOP_OFFSET;
+        self.dump_region("text", text_base, text_dump);
+        self.dump_region("data", data_base, DUMP_BYTES);
+        self.dump_region("bss", bss_base, DUMP_BYTES);
+        self.dump_region("heap", heap_base, DUMP_BYTES);
+        let stack_start = stack_top.saturating_sub(DUMP_BYTES as u64).max(stack_base);
+        self.dump_region("stack", stack_start, DUMP_BYTES);
+    }
+
+    fn dump_region(&mut self, label: &str, start: u64, len: usize) {
+        println!(
+            "-- {} [0x{:016x}..0x{:016x})",
+            label,
+            start,
+            start + len as u64
+        );
+        let mut addr = start;
+        let end = start + len as u64;
+        while addr < end {
+            print!("0x{:016x}:", addr);
+            let line_end = (addr + 16).min(end);
+            let mut cur = addr;
+            while cur < line_end {
+                let byte = match self.bus.read_u8(0, cur, AccessType::Debug) {
+                    Ok(b) => b,
+                    Err(_) => 0,
+                };
+                print!(" {:02x}", byte);
+                cur += 1;
+            }
+            println!();
+            addr = line_end;
+        }
+    }
+
+    pub fn dump_bus_stats(&self) {
+        let stats = self.bus.stats();
+        Self::print_stats("total", &stats.total);
+        for (i, counter) in stats.per_hart.iter().enumerate() {
+            Self::print_stats(&format!("hart {}", i), counter);
+        }
+        for dev in &stats.per_device {
+            Self::print_stats(&format!("device {}", dev.name), &dev.counter);
+        }
+    }
+
+    fn print_stats(label: &str, counter: &crate::bus::Counter) {
+        println!(
+            "bus {}: fetches={} reads={} writes={} bytes={}",
+            label,
+            counter.fetches,
+            counter.reads,
+            counter.writes,
+            counter.bytes
+        );
+    }
+
+    pub fn dump_sbi_stats(&self) {
+        self.sbi.dump_stats();
+    }
+
+    pub fn dump_hotpcs(&self) {
+        for hart in &self.harts {
+            hart.dump_hotpcs();
+        }
+    }
+}

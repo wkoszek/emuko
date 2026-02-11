@@ -1,0 +1,36 @@
+
+There are no discarded input sections
+
+Memory Configuration
+
+Name             Origin             Length             Attributes
+*default*        0x0000000000000000 0xffffffffffffffff
+
+Linker script and memory map
+
+LOAD /var/folders/vn/s_r11nx13rgf7b760mbjf5cr0000gn/T//cc8oI6hE.o
+                0x0000000080000000                . = 0x80000000
+
+.text           0x0000000080000000       0x8e
+ *(.text.start)
+ .text.start    0x0000000080000000       0x5c /var/folders/vn/s_r11nx13rgf7b760mbjf5cr0000gn/T//cc8oI6hE.o
+                0x0000000080000000                _start
+ *(.text*)
+ .text          0x000000008000005c        0x0 /var/folders/vn/s_r11nx13rgf7b760mbjf5cr0000gn/T//cc8oI6hE.o
+ *(.rodata*)
+ .rodata        0x000000008000005c       0x32 /var/folders/vn/s_r11nx13rgf7b760mbjf5cr0000gn/T//cc8oI6hE.o
+
+.data           0x0000000080000090        0x0
+ *(.data*)
+ .data          0x0000000080000090        0x0 /var/folders/vn/s_r11nx13rgf7b760mbjf5cr0000gn/T//cc8oI6hE.o
+
+.bss            0x0000000080000090        0x0
+ *(.bss*)
+ .bss           0x0000000080000090        0x0 /var/folders/vn/s_r11nx13rgf7b760mbjf5cr0000gn/T//cc8oI6hE.o
+ *(COMMON)
+OUTPUT(/Users/wkoszek/Sync/Projects/kriscv/smoke/build/uart_sbi_smoke.elf elf64-littleriscv)
+
+.riscv.attributes
+                0x0000000000000000       0x50
+ .riscv.attributes
+                0x0000000000000000       0x50 /var/folders/vn/s_r11nx13rgf7b760mbjf5cr0000gn/T//cc8oI6hE.o
