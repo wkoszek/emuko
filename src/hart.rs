@@ -329,6 +329,7 @@ impl Hart {
         self.last_access
     }
 
+    #[allow(dead_code)]
     pub fn recent_instrs(&self) -> &[(u64, u32, u8)] {
         &self.last_instrs
     }

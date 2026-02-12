@@ -14,6 +14,8 @@ fn print_usage_and_exit() -> ! {
     eprintln!("  kor ls");
     eprintln!("  kor snap");
     eprintln!("  kor set <register> <value>");
+    eprintln!("  kor uart-inject <text>");
+    eprintln!("  kor uart-read [n]");
     eprintln!("Env:");
     eprintln!("  KOR_ADDR=127.0.0.1:7788");
     std::process::exit(1);
@@ -25,6 +27,52 @@ fn parse_u64(arg: &str) -> Option<u64> {
     } else {
         arg.parse::<u64>().ok()
     }
+}
+
+fn decode_escapes(s: &str) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(s.len());
+    let mut it = s.chars().peekable();
+    while let Some(ch) = it.next() {
+        if ch != '\\' {
+            out.push(ch as u8);
+            continue;
+        }
+        let Some(next) = it.next() else {
+            out.push(b'\\');
+            break;
+        };
+        match next {
+            'n' => out.push(b'\n'),
+            'r' => out.push(b'\r'),
+            't' => out.push(b'\t'),
+            '\\' => out.push(b'\\'),
+            'x' => {
+                let Some(h1) = it.next() else {
+                    return Err("incomplete \\x escape".to_string());
+                };
+                let Some(h2) = it.next() else {
+                    return Err("incomplete \\x escape".to_string());
+                };
+                let hi = h1
+                    .to_digit(16)
+                    .ok_or_else(|| "invalid \\x escape".to_string())?;
+                let lo = h2
+                    .to_digit(16)
+                    .ok_or_else(|| "invalid \\x escape".to_string())?;
+                out.push(((hi << 4) | lo) as u8);
+            }
+            other => out.push(other as u8),
+        }
+    }
+    Ok(out)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{:02x}", b));
+    }
+    out
 }
 
 fn http_get(addr: &str, path: &str) -> Result<(u16, String), String> {
@@ -59,6 +107,7 @@ fn main() {
     };
     let addr = env::var("KOR_ADDR").unwrap_or_else(|_| "127.0.0.1:7788".to_string());
 
+    let mut raw_output = false;
     let path = match cmd.as_str() {
         "start" => "/v1/api/start".to_string(),
         "stop" => "/v1/api/stop".to_string(),
@@ -97,6 +146,33 @@ fn main() {
             }
             format!("/v1/api/set/{}/{}", reg, val)
         }
+        "uart-inject" => {
+            let rest: Vec<String> = args.collect();
+            if rest.is_empty() {
+                print_usage_and_exit();
+            }
+            let joined = rest.join(" ");
+            let bytes = match decode_escapes(&joined) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("invalid uart payload: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            format!("/v1/api/uart/inject-hex/{}", hex_encode(&bytes))
+        }
+        "uart-read" => {
+            raw_output = true;
+            if let Some(v) = args.next() {
+                if parse_u64(&v).is_none() {
+                    eprintln!("invalid read size: {}", v);
+                    std::process::exit(1);
+                }
+                format!("/v1/api/uart/read/{}", v)
+            } else {
+                "/v1/api/uart/read".to_string()
+            }
+        }
         _ => print_usage_and_exit(),
     };
 
@@ -108,7 +184,11 @@ fn main() {
         }
     };
     if !body.is_empty() {
-        println!("{}", body);
+        if raw_output {
+            print!("{}", body);
+        } else {
+            println!("{}", body);
+        }
     }
     if status >= 300 {
         std::process::exit(1);

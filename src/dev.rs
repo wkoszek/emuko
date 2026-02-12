@@ -154,6 +154,7 @@ pub struct Uart16550 {
     out_esc_state: u8,
     in_esc_state: u8,
     in_esc_buf: Vec<u8>,
+    tx_capture: VecDeque<u8>,
 }
 
 #[derive(Clone, Debug)]
@@ -175,6 +176,7 @@ pub struct UartSnapshot {
 const IER_ERBFI: u8 = 1 << 0;
 const IER_ETBEI: u8 = 1 << 1;
 const LCR_DLAB: u8 = 1 << 7;
+const UART_TX_CAPTURE_MAX: usize = 256 * 1024;
 
 impl Uart16550 {
     fn spawn_stdin_reader() -> Receiver<u8> {
@@ -224,10 +226,15 @@ impl Uart16550 {
             out_esc_state: 0,
             in_esc_state: 0,
             in_esc_buf: Vec::new(),
+            tx_capture: VecDeque::new(),
         }
     }
 
     fn emit_raw_char(&mut self, ch: u8) {
+        if self.tx_capture.len() >= UART_TX_CAPTURE_MAX {
+            self.tx_capture.pop_front();
+        }
+        self.tx_capture.push_back(ch);
         if self.color_enabled && !self.color_active {
             print!("\x1b[38;5;208m");
             self.color_active = true;
@@ -294,6 +301,27 @@ impl Uart16550 {
                 self.enqueue_rx(ch);
             }
         }
+    }
+
+    #[allow(dead_code)]
+    pub fn inject_bytes(&mut self, data: &[u8]) {
+        for &b in data {
+            self.enqueue_rx(b);
+        }
+        self.update_irq_line();
+    }
+
+    #[allow(dead_code)]
+    pub fn drain_tx_bytes(&mut self, max: usize) -> Vec<u8> {
+        if self.tx_capture.is_empty() {
+            return Vec::new();
+        }
+        let n = if max == 0 {
+            self.tx_capture.len()
+        } else {
+            max.min(self.tx_capture.len())
+        };
+        self.tx_capture.drain(..n).collect()
     }
 
     fn emit_char(&mut self, ch: u8) {
@@ -440,6 +468,7 @@ impl Uart16550 {
         self.out_esc_state = 0;
         self.in_esc_state = 0;
         self.in_esc_buf.clear();
+        self.tx_capture.clear();
         self.update_irq_line();
     }
 }

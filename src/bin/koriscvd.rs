@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 #[path = "../bus.rs"]
 mod bus;
 #[path = "../clint.rs"]
@@ -296,6 +298,29 @@ fn json_escape(s: &str) -> String {
         .replace('\n', "\\n")
 }
 
+fn decode_hex_bytes(s: &str) -> Result<Vec<u8>, String> {
+    if s.is_empty() {
+        return Ok(Vec::new());
+    }
+    if s.len() % 2 != 0 {
+        return Err("hex payload must have even length".to_string());
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let hi = (bytes[i] as char)
+            .to_digit(16)
+            .ok_or_else(|| "invalid hex digit".to_string())?;
+        let lo = (bytes[i + 1] as char)
+            .to_digit(16)
+            .ok_or_else(|| "invalid hex digit".to_string())?;
+        out.push(((hi << 4) | lo) as u8);
+        i += 2;
+    }
+    Ok(out)
+}
+
 fn state_json(st: &DaemonState) -> String {
     let hart = &st.system.harts[0];
     let stats = st.system.bus.stats();
@@ -426,6 +451,56 @@ fn handle_path(path: &str, st: &mut DaemonState) -> (u16, String, &'static str) 
     }
     if path == "/v1/api/disas" {
         return (200, disas_json(st), "application/json");
+    }
+    if let Some(hex) = path.strip_prefix("/v1/api/uart/inject-hex/") {
+        let bytes = match decode_hex_bytes(hex) {
+            Ok(v) => v,
+            Err(e) => {
+                return (
+                    400,
+                    format!("{{\"error\":\"{}\"}}", json_escape(&e)),
+                    "application/json",
+                );
+            }
+        };
+        let Some(uart) = st.system.bus.device_by_name_mut::<dev::Uart16550>("uart") else {
+            return (
+                500,
+                "{\"error\":\"uart device not found\"}".to_string(),
+                "application/json",
+            );
+        };
+        uart.inject_bytes(&bytes);
+        return (
+            200,
+            format!("{{\"injected\":{}}}", bytes.len()),
+            "application/json",
+        );
+    }
+    if path == "/v1/api/uart/read" || path.starts_with("/v1/api/uart/read/") {
+        let max = if path == "/v1/api/uart/read" {
+            4096usize
+        } else {
+            let tail = path.trim_start_matches("/v1/api/uart/read/");
+            let Some(v) = parse_u64(tail) else {
+                return (
+                    400,
+                    "{\"error\":\"invalid read size\"}".to_string(),
+                    "application/json",
+                );
+            };
+            v as usize
+        };
+        let Some(uart) = st.system.bus.device_by_name_mut::<dev::Uart16550>("uart") else {
+            return (
+                500,
+                "{\"error\":\"uart device not found\"}".to_string(),
+                "application/json",
+            );
+        };
+        let bytes = uart.drain_tx_bytes(max);
+        let text = String::from_utf8_lossy(&bytes).to_string();
+        return (200, text, "text/plain");
     }
     if path == "/v1/api/step" || path.starts_with("/v1/api/step/") {
         if st.running {
