@@ -18,12 +18,13 @@ use crate::bus::Bus;
 use std::env;
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
 use system::{System, DEFAULT_RAM_BASE, DEFAULT_RAM_SIZE};
 use trap::Trap;
 
 fn print_usage() {
     eprintln!(
-        "Usage: koriscv <binary> [--steps N] [--load-addr ADDR] [--entry-addr ADDR] [--ram-base ADDR] [--ram-size BYTES] [--dtb FILE] [--dtb-addr ADDR] [--initrd FILE] [--initrd-addr ADDR] [--linux] [--ext EXT] [--bootargs STR] [--trace-traps N] [--trace-instr N] [--save-snapshot FILE] [--load-snapshot FILE] [--autosnapshot-every N] [--autosnapshot-dir DIR] [--no-dump]"
+        "Usage: koriscv <binary> [--steps N] [--load-addr ADDR] [--entry-addr ADDR] [--ram-base ADDR] [--ram-size BYTES] [--dtb FILE] [--dtb-addr ADDR] [--initrd FILE] [--initrd-addr ADDR] [--linux] [--ext EXT] [--bootargs STR] [--trace-traps N] [--trace-instr N] [--save-snapshot FILE] [--load-snapshot FILE] [--autosnapshot-every N] [--autosnapshot-dir DIR] [--perf-report-count N] [--perf-report-secs S] [--perf-check-ticks N] [--uart-poll-wall-ms N] [--uart-poll-calib-ms N] [--uart-poll-check-ticks N] [--uart-poll-ticks N] [--uart-flush-every N] [--no-dump]"
     );
 }
 
@@ -97,6 +98,54 @@ fn parse_u64(arg: &str) -> Option<u64> {
         u64::from_str_radix(hex, 16).ok()
     } else {
         arg.parse::<u64>().ok()
+    }
+}
+
+fn parse_f64(arg: &str) -> Option<f64> {
+    arg.parse::<f64>().ok()
+}
+
+#[derive(Default)]
+struct RuntimeTuning {
+    perf_report_count: Option<u32>,
+    perf_report_secs: Option<f64>,
+    perf_check_ticks: Option<u32>,
+    uart_poll_wall_ms: Option<u64>,
+    uart_poll_calib_ms: Option<u64>,
+    uart_poll_check_ticks: Option<u32>,
+    uart_poll_ticks: Option<u32>,
+    uart_flush_every: Option<usize>,
+}
+
+impl RuntimeTuning {
+    fn apply(&self, system: &mut System) -> Result<(), String> {
+        let perf_interval = self.perf_report_secs.map(Duration::from_secs_f64);
+        system.configure_perf_reporting(
+            self.perf_report_count,
+            perf_interval,
+            self.perf_check_ticks,
+        );
+
+        if let Some(ticks) = self.uart_poll_ticks {
+            system.configure_uart_poll_fixed(ticks)?;
+        } else if self.uart_poll_wall_ms.is_some()
+            || self.uart_poll_calib_ms.is_some()
+            || self.uart_poll_check_ticks.is_some()
+        {
+            let wall_ms = self.uart_poll_wall_ms.unwrap_or(100);
+            let calib_ms = self.uart_poll_calib_ms.unwrap_or(250);
+            let check_ticks = self.uart_poll_check_ticks.unwrap_or(2048).max(1);
+            system.configure_uart_poll_auto(
+                Duration::from_millis(wall_ms),
+                Duration::from_millis(calib_ms),
+                check_ticks,
+            )?;
+        }
+
+        if let Some(every) = self.uart_flush_every {
+            system.configure_uart_flush_every(every)?;
+        }
+        Ok(())
     }
 }
 
@@ -181,6 +230,7 @@ fn main() {
     let mut autosnapshot_every: Option<u64> = None;
     let mut autosnapshot_dir: String = "/tmp/korisc5".to_string();
     let mut dump_state = true;
+    let mut tuning = RuntimeTuning::default();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--steps" => {
@@ -353,6 +403,97 @@ fn main() {
                 };
                 autosnapshot_dir = val;
             }
+            "--perf-report-count" => {
+                let Some(val) = args.next() else {
+                    eprintln!("Missing value for --perf-report-count");
+                    std::process::exit(1);
+                };
+                tuning.perf_report_count = parse_u64(&val).and_then(|v| u32::try_from(v).ok());
+                if tuning.perf_report_count.is_none() {
+                    eprintln!("Invalid --perf-report-count value: {val}");
+                    std::process::exit(1);
+                }
+            }
+            "--perf-report-secs" => {
+                let Some(val) = args.next() else {
+                    eprintln!("Missing value for --perf-report-secs");
+                    std::process::exit(1);
+                };
+                tuning.perf_report_secs = parse_f64(&val);
+                if tuning.perf_report_secs.is_none()
+                    || tuning.perf_report_secs.unwrap_or(0.0) <= 0.0
+                {
+                    eprintln!("Invalid --perf-report-secs value: {val}");
+                    std::process::exit(1);
+                }
+            }
+            "--perf-check-ticks" => {
+                let Some(val) = args.next() else {
+                    eprintln!("Missing value for --perf-check-ticks");
+                    std::process::exit(1);
+                };
+                tuning.perf_check_ticks = parse_u64(&val).and_then(|v| u32::try_from(v).ok());
+                if tuning.perf_check_ticks.unwrap_or(0) == 0 {
+                    eprintln!("Invalid --perf-check-ticks value: {val}");
+                    std::process::exit(1);
+                }
+            }
+            "--uart-poll-wall-ms" => {
+                let Some(val) = args.next() else {
+                    eprintln!("Missing value for --uart-poll-wall-ms");
+                    std::process::exit(1);
+                };
+                tuning.uart_poll_wall_ms = parse_u64(&val);
+                if tuning.uart_poll_wall_ms.unwrap_or(0) == 0 {
+                    eprintln!("Invalid --uart-poll-wall-ms value: {val}");
+                    std::process::exit(1);
+                }
+            }
+            "--uart-poll-calib-ms" => {
+                let Some(val) = args.next() else {
+                    eprintln!("Missing value for --uart-poll-calib-ms");
+                    std::process::exit(1);
+                };
+                tuning.uart_poll_calib_ms = parse_u64(&val);
+                if tuning.uart_poll_calib_ms.unwrap_or(0) == 0 {
+                    eprintln!("Invalid --uart-poll-calib-ms value: {val}");
+                    std::process::exit(1);
+                }
+            }
+            "--uart-poll-check-ticks" => {
+                let Some(val) = args.next() else {
+                    eprintln!("Missing value for --uart-poll-check-ticks");
+                    std::process::exit(1);
+                };
+                tuning.uart_poll_check_ticks =
+                    parse_u64(&val).and_then(|v| u32::try_from(v).ok());
+                if tuning.uart_poll_check_ticks.unwrap_or(0) == 0 {
+                    eprintln!("Invalid --uart-poll-check-ticks value: {val}");
+                    std::process::exit(1);
+                }
+            }
+            "--uart-poll-ticks" => {
+                let Some(val) = args.next() else {
+                    eprintln!("Missing value for --uart-poll-ticks");
+                    std::process::exit(1);
+                };
+                tuning.uart_poll_ticks = parse_u64(&val).and_then(|v| u32::try_from(v).ok());
+                if tuning.uart_poll_ticks.unwrap_or(0) == 0 {
+                    eprintln!("Invalid --uart-poll-ticks value: {val}");
+                    std::process::exit(1);
+                }
+            }
+            "--uart-flush-every" => {
+                let Some(val) = args.next() else {
+                    eprintln!("Missing value for --uart-flush-every");
+                    std::process::exit(1);
+                };
+                tuning.uart_flush_every = parse_u64(&val).and_then(|v| usize::try_from(v).ok());
+                if tuning.uart_flush_every.unwrap_or(0) == 0 {
+                    eprintln!("Invalid --uart-flush-every value: {val}");
+                    std::process::exit(1);
+                }
+            }
             "--no-dump" => {
                 dump_state = false;
             }
@@ -385,6 +526,10 @@ fn main() {
         }
         if trace_instr.is_some() {
             system.set_trace_instr(trace_instr);
+        }
+        if let Err(e) = tuning.apply(&mut system) {
+            eprintln!("Failed to apply runtime tuning: {}", e);
+            std::process::exit(1);
         }
         let mut exit_code = 0;
         let result = run_with_autosnapshot(
@@ -474,6 +619,10 @@ fn main() {
     let mut system = System::new(1, ram_base, ram_size, ext_mask);
     system.set_trace_traps(trace_traps);
     system.set_trace_instr(trace_instr);
+    if let Err(e) = tuning.apply(&mut system) {
+        eprintln!("Failed to apply runtime tuning: {}", e);
+        std::process::exit(1);
+    }
     let load_addr_arg = load_addr;
     let mut load_addr = load_addr_arg.unwrap_or(ram_base);
     let mut image_size = data.len() as u64;

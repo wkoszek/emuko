@@ -8,6 +8,7 @@ use std::io::{self, Read, Write};
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
+use std::time::{Duration, Instant};
 
 pub struct Ram {
     data: Vec<u8>,
@@ -155,6 +156,17 @@ pub struct Uart16550 {
     in_esc_state: u8,
     in_esc_buf: Vec<u8>,
     tx_capture: VecDeque<u8>,
+    poll_ticks: u32,
+    poll_countdown: u32,
+    adaptive_poll: bool,
+    poll_target_wall: Duration,
+    poll_calib_min_wall: Duration,
+    poll_calib_steps: u64,
+    poll_calib_started: Instant,
+    poll_check_ticks: u32,
+    poll_check_countdown: u32,
+    flush_every: usize,
+    flush_count: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -177,8 +189,44 @@ const IER_ERBFI: u8 = 1 << 0;
 const IER_ETBEI: u8 = 1 << 1;
 const LCR_DLAB: u8 = 1 << 7;
 const UART_TX_CAPTURE_MAX: usize = 256 * 1024;
+const UART_POLL_TICKS_DEFAULT: u32 = 1024;
+const UART_POLL_CHECK_TICKS_DEFAULT: u32 = 2048;
+const UART_POLL_WALL_MS_DEFAULT: u64 = 100;
+const UART_POLL_CALIB_MS_DEFAULT: u64 = 250;
+const UART_FLUSH_EVERY_DEFAULT: usize = 64;
 
 impl Uart16550 {
+    fn env_u64(name: &str, default: u64) -> u64 {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(default)
+    }
+
+    fn env_u32(name: &str, default: u32) -> u32 {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(default)
+    }
+
+    fn env_u32_opt(name: &str) -> Option<u32> {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|v| *v > 0)
+    }
+
+    fn env_usize(name: &str, default: usize) -> usize {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(default)
+    }
+
     fn spawn_stdin_reader() -> Receiver<u8> {
         let (tx, rx) = mpsc::channel::<u8>();
         thread::spawn(move || {
@@ -206,6 +254,19 @@ impl Uart16550 {
     }
 
     pub fn with_irq(plic: Rc<RefCell<PlicState>>, irq: usize) -> Self {
+        let fixed_poll_ticks = Self::env_u32_opt("UART_POLL_TICKS");
+        let adaptive_poll = fixed_poll_ticks.is_none();
+        let poll_ticks = fixed_poll_ticks.unwrap_or(UART_POLL_TICKS_DEFAULT);
+        let poll_target_wall = Duration::from_millis(Self::env_u64(
+            "UART_POLL_WALL_MS",
+            UART_POLL_WALL_MS_DEFAULT,
+        ));
+        let poll_calib_min_wall = Duration::from_millis(Self::env_u64(
+            "UART_POLL_CALIB_MS",
+            UART_POLL_CALIB_MS_DEFAULT,
+        ));
+        let poll_check_ticks = Self::env_u32("UART_POLL_CHECK_TICKS", UART_POLL_CHECK_TICKS_DEFAULT);
+        let flush_every = Self::env_usize("UART_FLUSH_EVERY", UART_FLUSH_EVERY_DEFAULT);
         Self {
             ier: 0,
             lcr: 0,
@@ -227,7 +288,68 @@ impl Uart16550 {
             in_esc_state: 0,
             in_esc_buf: Vec::new(),
             tx_capture: VecDeque::new(),
+            poll_ticks,
+            poll_countdown: poll_ticks,
+            adaptive_poll,
+            poll_target_wall,
+            poll_calib_min_wall,
+            poll_calib_steps: 0,
+            poll_calib_started: Instant::now(),
+            poll_check_ticks,
+            poll_check_countdown: poll_check_ticks,
+            flush_every,
+            flush_count: 0,
         }
+    }
+
+    fn maybe_recalibrate_poll_ticks(&mut self) {
+        if !self.adaptive_poll {
+            return;
+        }
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.poll_calib_started);
+        if elapsed < self.poll_calib_min_wall {
+            return;
+        }
+        if self.poll_calib_steps == 0 {
+            self.poll_calib_started = now;
+            return;
+        }
+        let steps_per_sec = self.poll_calib_steps as f64 / elapsed.as_secs_f64();
+        let mut next = (steps_per_sec * self.poll_target_wall.as_secs_f64()).round() as u64;
+        next = next.clamp(1, 50_000_000);
+        self.poll_ticks = next as u32;
+        if self.poll_countdown > self.poll_ticks {
+            self.poll_countdown = self.poll_ticks;
+        }
+        self.poll_calib_steps = 0;
+        self.poll_calib_started = now;
+    }
+
+    pub fn configure_poll_auto(
+        &mut self,
+        target_wall: Duration,
+        calib_min_wall: Duration,
+        check_ticks: u32,
+    ) {
+        self.adaptive_poll = true;
+        self.poll_target_wall = target_wall;
+        self.poll_calib_min_wall = calib_min_wall;
+        self.poll_check_ticks = check_ticks.max(1);
+        self.poll_check_countdown = self.poll_check_ticks;
+        self.poll_calib_steps = 0;
+        self.poll_calib_started = Instant::now();
+    }
+
+    pub fn configure_poll_fixed(&mut self, ticks: u32) {
+        let ticks = ticks.max(1);
+        self.adaptive_poll = false;
+        self.poll_ticks = ticks;
+        self.poll_countdown = ticks;
+    }
+
+    pub fn configure_flush_every(&mut self, every: usize) {
+        self.flush_every = every.max(1);
     }
 
     fn emit_raw_char(&mut self, ch: u8) {
@@ -240,7 +362,17 @@ impl Uart16550 {
             self.color_active = true;
         }
         print!("{}", ch as char);
-        let _ = io::stdout().flush();
+        if self.color_enabled && self.color_active && (ch == b'\n' || ch == b'\r') {
+            // Keep non-UART logs uncolored by resetting terminal color at line end.
+            print!("\x1b[0m");
+            self.color_active = false;
+        }
+        self.flush_count = self.flush_count.saturating_add(1);
+        let should_flush = ch == b'\n' || ch == b'\r' || self.flush_count >= self.flush_every;
+        if should_flush {
+            let _ = io::stdout().flush();
+            self.flush_count = 0;
+        }
     }
 
     fn enqueue_rx(&mut self, ch: u8) {
@@ -469,6 +601,11 @@ impl Uart16550 {
         self.in_esc_state = 0;
         self.in_esc_buf.clear();
         self.tx_capture.clear();
+        self.poll_countdown = self.poll_ticks;
+        self.poll_calib_steps = 0;
+        self.poll_calib_started = Instant::now();
+        self.poll_check_countdown = self.poll_check_ticks;
+        self.flush_count = 0;
         self.update_irq_line();
     }
 }
@@ -591,7 +728,19 @@ impl Device for Uart16550 {
     }
 
     fn tick(&mut self) {
-        self.poll_input();
+        self.poll_calib_steps = self.poll_calib_steps.saturating_add(1);
+        if self.poll_check_countdown <= 1 {
+            self.poll_check_countdown = self.poll_check_ticks;
+            self.maybe_recalibrate_poll_ticks();
+        } else {
+            self.poll_check_countdown -= 1;
+        }
+        if self.poll_countdown <= 1 {
+            self.poll_input();
+            self.poll_countdown = self.poll_ticks;
+        } else {
+            self.poll_countdown -= 1;
+        }
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {

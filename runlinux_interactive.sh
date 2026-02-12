@@ -76,45 +76,81 @@ fi
 
 cd "$ROOT_DIR"
 
-TIMEOUT_CMD=()
-if [[ -n "$TIMEOUT_SECS" && "$TIMEOUT_SECS" != "0" ]]; then
-  if command -v gtimeout >/dev/null 2>&1; then
-    TIMEOUT_CMD=(gtimeout "$TIMEOUT_SECS")
-  elif command -v timeout >/dev/null 2>&1; then
-    TIMEOUT_CMD=(timeout "$TIMEOUT_SECS")
-  else
-    echo "Warning: timeout not available; running without wall-clock limit." >&2
-  fi
-fi
+KOR_ADDR="${KOR_ADDR:-127.0.0.1:7788}"
+CHUNK_STEPS="${CHUNK_STEPS:-50000}"
+AUTOSTART="${AUTOSTART:-1}"
+STARTUP_WAIT_SECS="${STARTUP_WAIT_SECS:-10}"
 
-STEP_ARGS=()
 if [[ -n "$STEPS" ]]; then
-  STEP_ARGS+=(--steps "$STEPS")
+  echo "Warning: STEPS is ignored in daemon mode (use: kor step <n>)." >&2
 fi
-if [[ "$NO_DUMP" == "1" ]]; then
-  STEP_ARGS+=(--no-dump)
+if [[ "$TIMEOUT_SECS" != "0" ]]; then
+  echo "Warning: TIMEOUT_SECS is ignored in daemon mode." >&2
 fi
-
-SNAPSHOT_ARGS=()
-if [[ -n "$SNAPSHOT_LOAD" ]]; then
-  SNAPSHOT_ARGS+=(--load-snapshot "$SNAPSHOT_LOAD")
-fi
-if [[ -n "$SNAPSHOT_SAVE" ]]; then
-  SNAPSHOT_ARGS+=(--save-snapshot "$SNAPSHOT_SAVE")
+if [[ "$TRACE_TRAPS" != "0" || "$TRACE_INSTR" != "0" ]]; then
+  echo "Warning: TRACE_TRAPS/TRACE_INSTR are ignored by runlinux_interactive daemon path." >&2
 fi
 if [[ "$AUTOSNAPSHOT_EVERY" != "0" ]]; then
-  mkdir -p "$AUTOSNAPSHOT_DIR"
-  SNAPSHOT_ARGS+=(--autosnapshot-every "$AUTOSNAPSHOT_EVERY" --autosnapshot-dir "$AUTOSNAPSHOT_DIR")
+  echo "Warning: AUTOSNAPSHOT_EVERY is ignored in daemon mode (use: kor snap)." >&2
+fi
+if [[ -n "$SNAPSHOT_SAVE" ]]; then
+  echo "Warning: SNAPSHOT_SAVE is ignored in daemon mode (use: kor snap)." >&2
+fi
+if [[ ${#LOAD_ARGS[@]} -gt 0 ]]; then
+  echo "Warning: --load-addr/--entry-addr are not passed via daemon mode; PE kernel path is recommended." >&2
+fi
+if [[ ${#EXTRA_SIM_ARGS[@]} -gt 0 ]]; then
+  echo "Warning: extra simulator args are ignored by daemon launcher: ${EXTRA_SIM_ARGS[*]}" >&2
 fi
 
-exec ${TIMEOUT_CMD[@]+"${TIMEOUT_CMD[@]}"} cargo run --release --bin koriscv -- "$KERNEL" \
-  ${LOAD_ARGS[@]+"${LOAD_ARGS[@]}"} \
-  --ram-size "$RAM_SIZE" \
-  --initrd "$INITRD" \
-  --linux \
-  --bootargs "$BOOTARGS" \
-  ${STEP_ARGS[@]+"${STEP_ARGS[@]}"} \
-  ${SNAPSHOT_ARGS[@]+"${SNAPSHOT_ARGS[@]}"} \
-  --trace-traps "$TRACE_TRAPS" \
-  --trace-instr "$TRACE_INSTR" \
-  ${EXTRA_SIM_ARGS[@]+"${EXTRA_SIM_ARGS[@]}"}
+DAEMON_ARGS=(--addr "$KOR_ADDR" --snapshot-dir "$AUTOSNAPSHOT_DIR" --chunk-steps "$CHUNK_STEPS")
+if [[ -n "$SNAPSHOT_LOAD" ]]; then
+  DAEMON_ARGS+=(--snapshot "$SNAPSHOT_LOAD")
+else
+  DAEMON_ARGS+=("$KERNEL" "$INITRD" --ram-size "$RAM_SIZE" --bootargs "$BOOTARGS")
+fi
+
+echo "KoRISCV API: http://$KOR_ADDR/v1/api/{start,stop,dump,step,continue,set,uart}" >&2
+echo "Chunk steps: $CHUNK_STEPS" >&2
+
+cargo run --release --bin koriscvd -- "${DAEMON_ARGS[@]}" &
+daemon_pid=$!
+cleanup() {
+  if kill -0 "$daemon_pid" >/dev/null 2>&1; then
+    kill "$daemon_pid" >/dev/null 2>&1 || true
+    wait "$daemon_pid" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT INT TERM
+
+startup_deadline=$((SECONDS + STARTUP_WAIT_SECS))
+ready=0
+while [[ "$SECONDS" -lt "$startup_deadline" ]]; do
+  if command -v curl >/dev/null 2>&1; then
+    if curl -fsS "http://$KOR_ADDR/v1/api/dump" >/dev/null 2>&1; then
+      ready=1
+      break
+    fi
+  elif KOR_ADDR="$KOR_ADDR" target/release/kor dump >/dev/null 2>&1; then
+    ready=1
+    break
+  fi
+  sleep 0.05
+done
+if [[ "$ready" != "1" ]]; then
+  echo "Failed to reach daemon HTTP API at $KOR_ADDR" >&2
+  exit 1
+fi
+
+if [[ "$AUTOSTART" == "1" ]]; then
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsS "http://$KOR_ADDR/v1/api/continue" >/dev/null
+  else
+    KOR_ADDR="$KOR_ADDR" target/release/kor con >/dev/null
+  fi
+  echo "Execution started. Use 'kor stop' to pause and 'kor dump' to inspect state." >&2
+else
+  echo "Execution is paused. Start with: KOR_ADDR=$KOR_ADDR kor con" >&2
+fi
+
+wait "$daemon_pid"

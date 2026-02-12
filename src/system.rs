@@ -9,6 +9,7 @@ use crate::snapshot::{self, MachineSnapshot};
 use crate::trap::Trap;
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 pub const DEFAULT_RAM_BASE: u64 = 0x8000_0000;
 pub const DEFAULT_RAM_SIZE: usize = 64 * 1024 * 1024;
@@ -33,9 +34,93 @@ pub struct System {
     reset_pc: u64,
     trace_traps: Option<u64>,
     total_steps: u64,
+    perf_banner_printed: bool,
+    perf_start_at: Option<Instant>,
+    perf_last_report_at: Option<Instant>,
+    perf_last_report_steps: u64,
+    perf_report_count_cfg: u32,
+    perf_reports_left: u32,
+    perf_report_interval: Duration,
+    perf_check_ticks: u32,
+    perf_check_countdown: u32,
 }
 
 impl System {
+    fn env_u32(name: &str, default: u32) -> u32 {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(default)
+    }
+
+    fn perf_line(msg: &str) {
+        eprintln!("{}", msg);
+    }
+
+    fn ensure_perf_tracking_started(&mut self) {
+        if self.perf_banner_printed {
+            return;
+        }
+        let now = Instant::now();
+        self.perf_banner_printed = true;
+        self.perf_start_at = Some(now);
+        self.perf_last_report_at = Some(now);
+        self.perf_last_report_steps = self.total_steps;
+        self.perf_reports_left = self.perf_report_count_cfg;
+        self.perf_check_countdown = self.perf_check_ticks;
+        if self.perf_reports_left > 0 {
+            Self::perf_line(&format!(
+                "perf: startup benchmark active (reports={} every {:.2}s)",
+                self.perf_reports_left,
+                self.perf_report_interval.as_secs_f64()
+            ));
+        }
+    }
+
+    fn maybe_report_perf(&mut self) {
+        if self.perf_reports_left == 0 {
+            return;
+        }
+        let Some(last_at) = self.perf_last_report_at else {
+            return;
+        };
+        let now = Instant::now();
+        let elapsed = now.duration_since(last_at);
+        if elapsed < self.perf_report_interval {
+            return;
+        }
+        let dsteps = self.total_steps.saturating_sub(self.perf_last_report_steps);
+        if dsteps == 0 {
+            self.perf_last_report_at = Some(now);
+            return;
+        }
+        let cps = dsteps as f64 / elapsed.as_secs_f64();
+        let wall = self
+            .perf_start_at
+            .map(|t| now.duration_since(t).as_secs_f64())
+            .unwrap_or(elapsed.as_secs_f64());
+        Self::perf_line(&format!(
+            "perf: {:.2} Mcycles/s (delta_steps={} dt={:.2}s total_steps={} wall={:.2}s)",
+            cps / 1_000_000.0,
+            dsteps,
+            elapsed.as_secs_f64(),
+            self.total_steps,
+            wall
+        ));
+        self.perf_last_report_at = Some(now);
+        self.perf_last_report_steps = self.total_steps;
+        self.perf_reports_left = self.perf_reports_left.saturating_sub(1);
+    }
+
+    fn perf_tick(&mut self) {
+        if self.perf_check_countdown <= 1 {
+            self.perf_check_countdown = self.perf_check_ticks;
+            self.maybe_report_perf();
+        } else {
+            self.perf_check_countdown -= 1;
+        }
+    }
+
     pub fn new(num_harts: usize, ram_base: u64, ram_size: usize, misa_ext: u64) -> Self {
         let mut bus = Interconnect::new(num_harts);
         bus.add_device(
@@ -66,6 +151,15 @@ impl System {
         );
 
         let harts = (0..num_harts).map(|id| Hart::new(id, misa_ext)).collect();
+        let perf_check_ticks = Self::env_u32("KOR_PERF_CHECK_TICKS", 100_000).max(1);
+        let perf_report_count_cfg = Self::env_u32("KOR_PERF_REPORT_COUNT", 3);
+        let perf_report_interval = Duration::from_secs_f64(
+            std::env::var("KOR_PERF_REPORT_SECS")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .filter(|v| *v > 0.0)
+                .unwrap_or(1.0),
+        );
 
         Self {
             bus,
@@ -78,6 +172,15 @@ impl System {
             reset_pc: ram_base,
             trace_traps: None,
             total_steps: 0,
+            perf_banner_printed: false,
+            perf_start_at: None,
+            perf_last_report_at: None,
+            perf_last_report_steps: 0,
+            perf_report_count_cfg,
+            perf_reports_left: perf_report_count_cfg,
+            perf_report_interval,
+            perf_check_ticks,
+            perf_check_countdown: perf_check_ticks,
         }
     }
 
@@ -93,6 +196,63 @@ impl System {
         for hart in &mut self.harts {
             hart.set_trace_instr(limit);
         }
+    }
+
+    pub fn configure_perf_reporting(
+        &mut self,
+        report_count: Option<u32>,
+        report_interval: Option<Duration>,
+        check_ticks: Option<u32>,
+    ) {
+        if let Some(v) = report_count {
+            self.perf_report_count_cfg = v;
+            self.perf_reports_left = v;
+        }
+        if let Some(v) = report_interval {
+            self.perf_report_interval = v;
+        }
+        if let Some(v) = check_ticks {
+            let vv = v.max(1);
+            self.perf_check_ticks = vv;
+            self.perf_check_countdown = vv;
+        }
+        // Start fresh at next run() with updated settings.
+        self.perf_banner_printed = false;
+        self.perf_start_at = None;
+        self.perf_last_report_at = None;
+        self.perf_last_report_steps = self.total_steps;
+    }
+
+    pub fn configure_uart_poll_auto(
+        &mut self,
+        target_wall: Duration,
+        calib_min_wall: Duration,
+        check_ticks: u32,
+    ) -> Result<(), String> {
+        let uart = self
+            .bus
+            .device_by_name_mut::<Uart16550>("uart")
+            .ok_or_else(|| "UART device not found".to_string())?;
+        uart.configure_poll_auto(target_wall, calib_min_wall, check_ticks);
+        Ok(())
+    }
+
+    pub fn configure_uart_poll_fixed(&mut self, ticks: u32) -> Result<(), String> {
+        let uart = self
+            .bus
+            .device_by_name_mut::<Uart16550>("uart")
+            .ok_or_else(|| "UART device not found".to_string())?;
+        uart.configure_poll_fixed(ticks);
+        Ok(())
+    }
+
+    pub fn configure_uart_flush_every(&mut self, every: usize) -> Result<(), String> {
+        let uart = self
+            .bus
+            .device_by_name_mut::<Uart16550>("uart")
+            .ok_or_else(|| "UART device not found".to_string())?;
+        uart.configure_flush_every(every);
+        Ok(())
     }
 
     pub fn configure_linux_boot(&mut self, dtb_addr: u64) {
@@ -138,6 +298,12 @@ impl System {
         }
         self.bus.stats_mut().reset();
         self.total_steps = 0;
+        self.perf_banner_printed = false;
+        self.perf_start_at = None;
+        self.perf_last_report_at = None;
+        self.perf_last_report_steps = 0;
+        self.perf_reports_left = self.perf_report_count_cfg;
+        self.perf_check_countdown = self.perf_check_ticks;
     }
 
     pub fn load(&mut self, addr: u64, data: &[u8]) -> Result<(), Trap> {
@@ -162,6 +328,7 @@ impl System {
     }
 
     pub fn run(&mut self, max_steps: Option<u64>) -> Result<u64, Trap> {
+        self.ensure_perf_tracking_started();
         let mut steps = 0u64;
         loop {
             if let Some(limit) = max_steps {
@@ -169,75 +336,81 @@ impl System {
                     break;
                 }
             }
-            for hart in &mut self.harts {
+            for hart_idx in 0..self.harts.len() {
                 if let Some(limit) = max_steps {
                     if steps >= limit {
                         break;
                     }
                 }
                 self.bus.tick_devices();
-                if let Err(trap) = hart.step(&mut self.bus, &mut self.sbi) {
-                    if let Some(left) = self.trace_traps.as_mut() {
-                        if *left > 0 {
-                            eprintln!(
-                                "trap hart={} pc=0x{:016x} {:?}",
-                                hart.hart_id, hart.pc, trap
-                            );
-                            if let Some((kind, addr, size)) = hart.last_access() {
-                                eprintln!(
-                                    "  last_access kind={:?} addr=0x{:016x} size={}",
-                                    kind, addr, size
-                                );
-                            }
-                            eprintln!(
-                                "  regs a0=0x{:016x} a1=0x{:016x} a2=0x{:016x} a3=0x{:016x}",
-                                hart.regs[10], hart.regs[11], hart.regs[12], hart.regs[13]
-                            );
-                            eprintln!(
-                                "  satp=0x{:016x} sstatus=0x{:016x} sepc=0x{:016x} scause=0x{:016x} stval=0x{:016x}",
-                                hart.csrs.read(crate::csr::CSR_SATP),
-                                hart.csrs.read(crate::csr::CSR_SSTATUS),
-                                hart.csrs.read(crate::csr::CSR_SEPC),
-                                hart.csrs.read(crate::csr::CSR_SCAUSE),
-                                hart.csrs.read(crate::csr::CSR_STVAL)
-                            );
-                            *left -= 1;
-                        }
-                    }
-                    hart.handle_trap(trap);
-                }
-                self.sbi.tick(1);
-                let now = self.sbi.time();
-                hart.csrs.set_time(now);
                 {
-                    let due = self.sbi.timer_due(hart.hart_id);
-                    let mut sip = hart.csrs.read(crate::csr::CSR_SIP);
-                    if due {
-                        sip |= crate::csr::SIP_STIP;
-                    } else {
-                        sip &= !crate::csr::SIP_STIP;
+                    let hart = &mut self.harts[hart_idx];
+                    if let Err(trap) = hart.step(&mut self.bus, &mut self.sbi) {
+                        if let Some(left) = self.trace_traps.as_mut() {
+                            if *left > 0 {
+                                eprintln!(
+                                    "trap hart={} pc=0x{:016x} {:?}",
+                                    hart.hart_id, hart.pc, trap
+                                );
+                                if let Some((kind, addr, size)) = hart.last_access() {
+                                    eprintln!(
+                                        "  last_access kind={:?} addr=0x{:016x} size={}",
+                                        kind, addr, size
+                                    );
+                                }
+                                eprintln!(
+                                    "  regs a0=0x{:016x} a1=0x{:016x} a2=0x{:016x} a3=0x{:016x}",
+                                    hart.regs[10], hart.regs[11], hart.regs[12], hart.regs[13]
+                                );
+                                eprintln!(
+                                    "  satp=0x{:016x} sstatus=0x{:016x} sepc=0x{:016x} scause=0x{:016x} stval=0x{:016x}",
+                                    hart.csrs.read(crate::csr::CSR_SATP),
+                                    hart.csrs.read(crate::csr::CSR_SSTATUS),
+                                    hart.csrs.read(crate::csr::CSR_SEPC),
+                                    hart.csrs.read(crate::csr::CSR_SCAUSE),
+                                    hart.csrs.read(crate::csr::CSR_STVAL)
+                                );
+                                *left -= 1;
+                            }
+                        }
+                        hart.handle_trap(trap);
                     }
-                    let ssip = self.clint.borrow().software_pending(hart.hart_id);
-                    if ssip {
-                        sip |= crate::csr::SIP_SSIP;
-                    } else {
-                        sip &= !crate::csr::SIP_SSIP;
+                    self.sbi.tick(1);
+                    let now = self.sbi.time();
+                    hart.csrs.set_time(now);
+                    {
+                        let due = self.sbi.timer_due(hart.hart_id);
+                        let mut sip = hart.csrs.read(crate::csr::CSR_SIP);
+                        if due {
+                            sip |= crate::csr::SIP_STIP;
+                        } else {
+                            sip &= !crate::csr::SIP_STIP;
+                        }
+                        let ssip = self.clint.borrow().software_pending(hart.hart_id);
+                        if ssip {
+                            sip |= crate::csr::SIP_SSIP;
+                        } else {
+                            sip &= !crate::csr::SIP_SSIP;
+                        }
+                        let seip = self.plic.borrow().pending_for_hart(hart.hart_id);
+                        if seip {
+                            sip |= crate::csr::SIP_SEIP;
+                        } else {
+                            sip &= !crate::csr::SIP_SEIP;
+                        }
+                        hart.csrs.write(crate::csr::CSR_SIP, sip);
                     }
-                    let seip = self.plic.borrow().pending_for_hart(hart.hart_id);
-                    if seip {
-                        sip |= crate::csr::SIP_SEIP;
-                    } else {
-                        sip &= !crate::csr::SIP_SEIP;
-                    }
-                    hart.csrs.write(crate::csr::CSR_SIP, sip);
                 }
                 steps += 1;
                 self.total_steps = self.total_steps.wrapping_add(1);
+                self.perf_tick();
                 if self.sbi.shutdown_requested() {
+                    self.maybe_report_perf();
                     return Ok(steps);
                 }
             }
         }
+        self.maybe_report_perf();
         Ok(steps)
     }
 
@@ -315,6 +488,12 @@ impl System {
             .ok_or_else(|| "UART device not found".to_string())?
             .restore(snap.uart);
         *system.bus.stats_mut() = snap.bus_stats;
+        system.perf_banner_printed = false;
+        system.perf_start_at = None;
+        system.perf_last_report_at = None;
+        system.perf_last_report_steps = system.total_steps;
+        system.perf_reports_left = system.perf_report_count_cfg;
+        system.perf_check_countdown = system.perf_check_ticks;
         Ok(system)
     }
 
