@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT_DIR"
+
+KOR_BIN="${KOR_BIN:-target/release/kor}"
+KOR_ADDR="${KOR_ADDR:-127.0.0.1:7789}"
+LOG_DIR="${LOG_DIR:-/tmp/korisc5-debug}"
+READ_CHUNK="${READ_CHUNK:-120000}"
+SLICE_SLEEP="${SLICE_SLEEP:-0.20}"
+MAX_SLICES="${MAX_SLICES:-220}"
+
+mkdir -p "$LOG_DIR"
+TS="$(date +%Y%m%d-%H%M%S)"
+UART_LOG="$LOG_DIR/repro-lsl-entries-uart-$TS.log"
+UART_RAW="$LOG_DIR/repro-lsl-entries-uart-raw-$TS.log"
+STATE_LOG="$LOG_DIR/repro-lsl-entries-state-$TS.log"
+
+kor() {
+  KOR_ADDR="$KOR_ADDR" "$KOR_BIN" "$@"
+}
+
+kor_retry() {
+  local out=""
+  for _ in 1 2 3 4 5; do
+    if out="$(kor "$@" 2>/dev/null)"; then
+      printf '%s' "$out"
+      return 0
+    fi
+    sleep 0.05
+  done
+  return 1
+}
+
+stamp() {
+  date "+%Y-%m-%d %H:%M:%S"
+}
+
+drain_uart() {
+  local tag="$1"
+  local out
+  out="$(kor_retry uart-read "$READ_CHUNK" || true)"
+  if [[ -n "$out" ]]; then
+    printf '%s' "$out" >>"$UART_RAW"
+    {
+      echo "=== $tag @ $(stamp) ==="
+      printf '%s' "$out"
+      echo
+    } >>"$UART_LOG"
+  fi
+}
+
+sample_state() {
+  local tag="$1"
+  {
+    echo "=== $tag @ $(stamp) ==="
+    kor_retry dump || echo "dump_failed"
+    kor_retry disas || echo "disas_failed"
+    echo
+  } >>"$STATE_LOG"
+}
+
+wait_for_token() {
+  local token="$1"
+  local tag="$2"
+  local i
+  for i in $(seq 1 "$MAX_SLICES"); do
+    sleep "$SLICE_SLEEP"
+    drain_uart "$tag/slice_$i"
+    if rg -q "$token" "$UART_RAW"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+run_lsl_entry() {
+  local entry="$1"
+  local idx="$2"
+  local safe
+  safe="$(echo "$entry" | sed 's#[^A-Za-z0-9]#_#g')"
+  local start="__LSL_ENTRY_${idx}_${safe}_BEGIN__"
+  local end="__LSL_ENTRY_${idx}_${safe}_END__"
+
+  echo "Running: ls -l $entry"
+  kor_retry uart-inject "echo ${start}\\nls -l ${entry}\\necho ${end}\\n" >/dev/null
+  if ! wait_for_token "$end" "lsl_${idx}_${safe}"; then
+    echo "Timeout waiting for $end"
+    sample_state "lsl_${idx}_${safe}/timeout"
+    return 1
+  fi
+  return 0
+}
+
+if ! kor_retry dump >/dev/null; then
+  echo "Daemon not reachable at $KOR_ADDR" >&2
+  exit 1
+fi
+
+kor_retry con >/dev/null || true
+sleep 0.05
+kor_retry uart-inject "\\x03\\n" >/dev/null || true
+sleep 0.15
+drain_uart "recover"
+
+# Requested order with initrd last.
+ENTRIES=(bin etc media proc run sys usr dev init lib mnt root sbin tmp var initrd)
+
+rc=0
+i=1
+for e in "${ENTRIES[@]}"; do
+  run_lsl_entry "$e" "$i" || rc=1
+  i=$((i + 1))
+done
+
+echo "UART log:      $UART_LOG"
+echo "UART raw log:  $UART_RAW"
+echo "State log:     $STATE_LOG"
+exit "$rc"

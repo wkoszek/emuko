@@ -196,6 +196,17 @@ const UART_POLL_CALIB_MS_DEFAULT: u64 = 250;
 const UART_FLUSH_EVERY_DEFAULT: usize = 64;
 
 impl Uart16550 {
+    fn env_bool(name: &str, default: bool) -> bool {
+        match std::env::var(name) {
+            Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+                "0" | "false" | "no" | "off" => false,
+                "1" | "true" | "yes" | "on" => true,
+                _ => default,
+            },
+            Err(_) => default,
+        }
+    }
+
     fn env_u64(name: &str, default: u64) -> u64 {
         std::env::var(name)
             .ok()
@@ -257,6 +268,7 @@ impl Uart16550 {
         let fixed_poll_ticks = Self::env_u32_opt("UART_POLL_TICKS");
         let adaptive_poll = fixed_poll_ticks.is_none();
         let poll_ticks = fixed_poll_ticks.unwrap_or(UART_POLL_TICKS_DEFAULT);
+        let host_stdin_enabled = Self::env_bool("UART_HOST_STDIN", true);
         let poll_target_wall = Duration::from_millis(Self::env_u64(
             "UART_POLL_WALL_MS",
             UART_POLL_WALL_MS_DEFAULT,
@@ -278,7 +290,11 @@ impl Uart16550 {
             tx_irq_pending: false,
             rx_irq_pending: false,
             rx_fifo: VecDeque::new(),
-            input_rx: Some(Self::spawn_stdin_reader()),
+            input_rx: if host_stdin_enabled {
+                Some(Self::spawn_stdin_reader())
+            } else {
+                None
+            },
             irq: Some((plic, irq)),
             color_enabled: true,
             color_active: false,
@@ -439,6 +455,14 @@ impl Uart16550 {
     pub fn inject_bytes(&mut self, data: &[u8]) {
         for &b in data {
             self.enqueue_rx(b);
+        }
+        self.update_irq_line();
+    }
+
+    #[allow(dead_code)]
+    pub fn inject_host_bytes(&mut self, data: &[u8]) {
+        for &b in data {
+            self.handle_input_byte(b);
         }
         self.update_irq_line();
     }

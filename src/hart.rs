@@ -358,6 +358,16 @@ impl Hart {
         bus.write_u64(self.hart_id, addr, value, AccessType::Debug)
     }
 
+    #[allow(dead_code)]
+    pub fn debug_read_u16_virt(&mut self, bus: &mut dyn Bus, addr: u64) -> Result<u16, Trap> {
+        self.read_u16(bus, addr, AccessType::Debug)
+    }
+
+    #[allow(dead_code)]
+    pub fn debug_read_u32_virt(&mut self, bus: &mut dyn Bus, addr: u64) -> Result<u32, Trap> {
+        self.read_u32(bus, addr, AccessType::Debug)
+    }
+
     fn translate_addr(
         &mut self,
         bus: &mut dyn Bus,
@@ -1147,11 +1157,13 @@ impl Hart {
                     // RV64M (partial; MULH variants computed via 128-bit)
                     (F7_MULDIV, F3_ADD_SUB) => a.wrapping_mul(b),
                     (F7_MULDIV, F3_SLL) => {
-                        let prod = (a as i128).wrapping_mul(b as i128);
+                        // MULH: signed x signed high-half
+                        let prod = (a as i64 as i128).wrapping_mul(b as i64 as i128);
                         (prod >> 64) as u64
                     }
                     (F7_MULDIV, F3_SLT) => {
-                        let prod = (a as i128).wrapping_mul(b as u128 as i128);
+                        // MULHSU: signed x unsigned high-half
+                        let prod = (a as i64 as i128).wrapping_mul(b as u128 as i128);
                         (prod >> 64) as u64
                     }
                     (F7_MULDIV, F3_SLTU) => {

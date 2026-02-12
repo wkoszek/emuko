@@ -37,9 +37,10 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
 use std::time::Duration;
 
-use bus::{AccessType, Bus};
 use system::System;
 
 const NAME: &str = "KoRISCV";
@@ -54,6 +55,7 @@ struct DaemonOpts {
     addr: String,
     snapshot_dir: String,
     chunk_steps: u64,
+    autostart: bool,
 }
 
 struct DaemonState {
@@ -72,7 +74,7 @@ enum RegTarget {
 
 fn print_usage_and_exit() -> ! {
     eprintln!(
-        "Usage: koriscvd [--snapshot FILE] [<kernel> <initrd>] [--ram-size BYTES] [--bootargs STR] [--addr HOST:PORT] [--snapshot-dir DIR] [--chunk-steps N]"
+        "Usage: koriscvd [--snapshot FILE] [<kernel> <initrd>] [--ram-size BYTES] [--bootargs STR] [--addr HOST:PORT] [--snapshot-dir DIR] [--chunk-steps N] [--autostart]"
     );
     std::process::exit(1);
 }
@@ -97,6 +99,7 @@ fn parse_opts() -> DaemonOpts {
     let mut addr = "127.0.0.1:7788".to_string();
     let mut snapshot_dir = "/tmp/korisc5".to_string();
     let mut chunk_steps = 50_000u64;
+    let mut autostart = false;
     let mut positionals = Vec::new();
 
     while let Some(arg) = args.next() {
@@ -143,6 +146,9 @@ fn parse_opts() -> DaemonOpts {
                     std::process::exit(1);
                 });
             }
+            "--autostart" => {
+                autostart = true;
+            }
             _ if arg.starts_with("--") => {
                 eprintln!("Unknown argument: {arg}");
                 print_usage_and_exit();
@@ -169,6 +175,7 @@ fn parse_opts() -> DaemonOpts {
         addr,
         snapshot_dir,
         chunk_steps,
+        autostart,
     }
 }
 
@@ -372,16 +379,21 @@ fn state_json(st: &DaemonState) -> String {
 }
 
 fn disas_json(st: &mut DaemonState) -> String {
-    let hart = &st.system.harts[0];
-    let pc = hart.pc;
-    let h16 = st.system.bus.read_u16(0, pc, AccessType::Debug);
+    let pc = st.system.harts[0].pc;
+    let h16 = {
+        let hart = &mut st.system.harts[0];
+        hart.debug_read_u16_virt(&mut st.system.bus, pc)
+    };
     let mut raw = String::new();
     let mut name = String::from("unmapped");
     if let Ok(v16) = h16 {
         if (v16 & 0x3) != 0x3 {
             raw = format!("0x{:04x}", v16);
             name = disas::disas16(v16);
-        } else if let Ok(v32) = st.system.bus.read_u32(0, pc, AccessType::Debug) {
+        } else if let Ok(v32) = {
+            let hart = &mut st.system.harts[0];
+            hart.debug_read_u32_virt(&mut st.system.bus, pc)
+        } {
             raw = format!("0x{:08x}", v32);
             name = disas::disas32(v32);
         }
@@ -662,6 +674,55 @@ fn handle_connection(mut stream: TcpStream, st: &mut DaemonState) {
     write_http(stream, code, &body, ctype);
 }
 
+fn spawn_stdin_reader() -> Receiver<u8> {
+    let (tx, rx) = mpsc::channel::<u8>();
+    thread::spawn(move || {
+        let stdin = std::io::stdin();
+        let mut locked = stdin.lock();
+        let mut buf = [0u8; 1];
+        loop {
+            match locked.read(&mut buf) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if tx.send(buf[0]).is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    if e.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+    });
+    rx
+}
+
+fn pump_console_input(st: &mut DaemonState, stdin_rx: &Receiver<u8>) {
+    let mut bytes = Vec::with_capacity(128);
+    loop {
+        match stdin_rx.try_recv() {
+            Ok(b) => {
+                // Normalize Enter key from host terminal for guest shells.
+                bytes.push(if b == b'\r' { b'\n' } else { b });
+                if bytes.len() >= 1024 {
+                    break;
+                }
+            }
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Disconnected) => break,
+        }
+    }
+    if bytes.is_empty() {
+        return;
+    }
+    if let Some(uart) = st.system.bus.device_by_name_mut::<dev::Uart16550>("uart") {
+        uart.inject_host_bytes(&bytes);
+    }
+}
+
 fn load_initial_state(opts: &DaemonOpts) -> Result<(System, String), String> {
     let boot_snapshot = if let Some(s) = &opts.snapshot {
         s.clone()
@@ -675,11 +736,13 @@ fn load_initial_state(opts: &DaemonOpts) -> Result<(System, String), String> {
 fn run_loop(mut st: DaemonState, addr: &str) -> Result<(), String> {
     let listener = TcpListener::bind(addr).map_err(|e| e.to_string())?;
     listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+    let stdin_rx = spawn_stdin_reader();
     eprintln!(
         "{} daemon listening on http://{} (chunk_steps={}, boot_snapshot={})",
         NAME, addr, st.chunk_steps, st.boot_snapshot
     );
     loop {
+        pump_console_input(&mut st, &stdin_rx);
         if st.running {
             let chunk = st.chunk_steps;
             match run_steps(&mut st, chunk) {
@@ -700,11 +763,14 @@ fn run_loop(mut st: DaemonState, addr: &str) -> Result<(), String> {
                 Err(_) => break,
             }
         }
+        pump_console_input(&mut st, &stdin_rx);
         std::thread::sleep(Duration::from_millis(if st.running { 1 } else { 3 }));
     }
 }
 
 fn main() {
+    // Daemon owns stdin-to-UART bridging; keep UART device stdin reader disabled to avoid races.
+    std::env::set_var("UART_HOST_STDIN", "0");
     let opts = parse_opts();
     let (system, boot_snapshot) = match load_initial_state(&opts) {
         Ok(v) => v,
@@ -715,7 +781,7 @@ fn main() {
     };
     let st = DaemonState {
         system,
-        running: false,
+        running: opts.autostart,
         boot_snapshot,
         snapshot_dir: opts.snapshot_dir.clone(),
         chunk_steps: opts.chunk_steps.max(1),

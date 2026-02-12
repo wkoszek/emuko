@@ -80,6 +80,15 @@ KOR_ADDR="${KOR_ADDR:-127.0.0.1:7788}"
 CHUNK_STEPS="${CHUNK_STEPS:-50000}"
 AUTOSTART="${AUTOSTART:-1}"
 STARTUP_WAIT_SECS="${STARTUP_WAIT_SECS:-10}"
+REUSE_DAEMON="${REUSE_DAEMON:-0}"
+USE_RELEASE_BIN="${USE_RELEASE_BIN:-0}"
+UART_FLUSH_EVERY="${UART_FLUSH_EVERY:-1}"
+DAEMON_FOREGROUND="${DAEMON_FOREGROUND:-1}"
+
+if [[ ! -t 0 && "$DAEMON_FOREGROUND" == "1" ]]; then
+  echo "Warning: forcing DAEMON_FOREGROUND=0 because stdin is not a TTY." >&2
+  DAEMON_FOREGROUND=0
+fi
 
 if [[ -n "$STEPS" ]]; then
   echo "Warning: STEPS is ignored in daemon mode (use: kor step <n>)." >&2
@@ -110,13 +119,60 @@ else
   DAEMON_ARGS+=("$KERNEL" "$INITRD" --ram-size "$RAM_SIZE" --bootargs "$BOOTARGS")
 fi
 
+api_ready() {
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsS "http://$KOR_ADDR/v1/api/dump" >/dev/null 2>&1
+  else
+    KOR_ADDR="$KOR_ADDR" target/release/kor dump >/dev/null 2>&1
+  fi
+}
+
+daemon_pid=""
+existing_daemon=0
+if api_ready; then
+  if [[ "$REUSE_DAEMON" == "1" ]]; then
+    existing_daemon=1
+    echo "Reusing existing daemon at $KOR_ADDR" >&2
+  else
+    echo "Error: daemon already listening at $KOR_ADDR." >&2
+    echo "Use a different KOR_ADDR, stop the old daemon, or set REUSE_DAEMON=1." >&2
+    exit 1
+  fi
+fi
+
 echo "KoRISCV API: http://$KOR_ADDR/v1/api/{start,stop,dump,step,continue,set,uart}" >&2
 echo "Chunk steps: $CHUNK_STEPS" >&2
 
-cargo run --release --bin koriscvd -- "${DAEMON_ARGS[@]}" &
-daemon_pid=$!
+# Foreground mode keeps daemon attached to this TTY, so host stdin -> UART works.
+if [[ "$existing_daemon" != "1" && "$DAEMON_FOREGROUND" == "1" ]]; then
+  if [[ "$AUTOSTART" == "1" ]]; then
+    DAEMON_ARGS+=(--autostart)
+    echo "Execution started (daemon foreground mode)." >&2
+  else
+    echo "Execution is paused. Start with: KOR_ADDR=$KOR_ADDR kor con" >&2
+  fi
+  if [[ "$USE_RELEASE_BIN" == "1" && -x target/release/koriscvd ]]; then
+    echo "Launch mode: release binary foreground (USE_RELEASE_BIN=1)" >&2
+    exec env UART_FLUSH_EVERY="$UART_FLUSH_EVERY" target/release/koriscvd "${DAEMON_ARGS[@]}"
+  else
+    echo "Launch mode: cargo run --release --bin koriscvd foreground" >&2
+    exec env UART_FLUSH_EVERY="$UART_FLUSH_EVERY" cargo run --release --bin koriscvd -- "${DAEMON_ARGS[@]}"
+  fi
+fi
+
+if [[ "$existing_daemon" != "1" ]]; then
+  if [[ "$USE_RELEASE_BIN" == "1" && -x target/release/koriscvd ]]; then
+    echo "Launch mode: release binary (USE_RELEASE_BIN=1)" >&2
+    UART_FLUSH_EVERY="$UART_FLUSH_EVERY" target/release/koriscvd "${DAEMON_ARGS[@]}" &
+  else
+    echo "Launch mode: cargo run --release --bin koriscvd" >&2
+    UART_FLUSH_EVERY="$UART_FLUSH_EVERY" cargo run --release --bin koriscvd -- "${DAEMON_ARGS[@]}" &
+  fi
+  daemon_pid=$!
+fi
+
 cleanup() {
-  if kill -0 "$daemon_pid" >/dev/null 2>&1; then
+  if [[ -n "$daemon_pid" ]] && kill -0 "$daemon_pid" >/dev/null 2>&1; then
     kill "$daemon_pid" >/dev/null 2>&1 || true
     wait "$daemon_pid" >/dev/null 2>&1 || true
   fi
@@ -126,12 +182,12 @@ trap cleanup EXIT INT TERM
 startup_deadline=$((SECONDS + STARTUP_WAIT_SECS))
 ready=0
 while [[ "$SECONDS" -lt "$startup_deadline" ]]; do
-  if command -v curl >/dev/null 2>&1; then
-    if curl -fsS "http://$KOR_ADDR/v1/api/dump" >/dev/null 2>&1; then
-      ready=1
-      break
-    fi
-  elif KOR_ADDR="$KOR_ADDR" target/release/kor dump >/dev/null 2>&1; then
+  if [[ -n "$daemon_pid" ]] && ! kill -0 "$daemon_pid" >/dev/null 2>&1; then
+    wait "$daemon_pid" || true
+    echo "Daemon exited before API became ready." >&2
+    exit 1
+  fi
+  if api_ready; then
     ready=1
     break
   fi
@@ -153,4 +209,11 @@ else
   echo "Execution is paused. Start with: KOR_ADDR=$KOR_ADDR kor con" >&2
 fi
 
-wait "$daemon_pid"
+if [[ -n "$daemon_pid" ]]; then
+  wait "$daemon_pid"
+else
+  echo "Reused existing daemon at $KOR_ADDR; leaving script now." >&2
+  if [[ "$DAEMON_FOREGROUND" == "1" ]]; then
+    echo "Note: foreground stdin bridging is unavailable when reusing an existing daemon." >&2
+  fi
+fi
