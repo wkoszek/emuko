@@ -92,7 +92,7 @@ if [[ "$AUTOSNAPSHOT_EVERY" != "0" ]]; then
   SNAPSHOT_ARGS+=(--autosnapshot-every "$AUTOSNAPSHOT_EVERY" --autosnapshot-dir "$AUTOSNAPSHOT_DIR")
 fi
 
-exec ${TIMEOUT_CMD[@]+"${TIMEOUT_CMD[@]}"} cargo run --release -- "$KERNEL" \
+exec ${TIMEOUT_CMD[@]+"${TIMEOUT_CMD[@]}"} cargo run --release --bin koriscv -- "$KERNEL" \
   ${LOAD_ARGS[@]+"${LOAD_ARGS[@]}"} \
   --ram-size "$RAM_SIZE" \
   --initrd "$INITRD" \

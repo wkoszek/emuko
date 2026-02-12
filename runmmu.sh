@@ -42,7 +42,7 @@ if [[ -n "$TIMEOUT_SECS" && "$TIMEOUT_SECS" != "0" ]]; then
 fi
 
 cd "$ROOT_DIR"
-exec ${TIMEOUT_CMD[@]+"${TIMEOUT_CMD[@]}"} cargo run --release -- \
+exec ${TIMEOUT_CMD[@]+"${TIMEOUT_CMD[@]}"} cargo run --release --bin koriscv -- \
   "$BIN" \
   --load-addr 0x80000000 \
   --entry-addr 0x80000000 \

@@ -151,6 +151,9 @@ pub struct Uart16550 {
     color_active: bool,
     trace_input: bool,
     irq_line: bool,
+    out_esc_state: u8,
+    in_esc_state: u8,
+    in_esc_buf: Vec<u8>,
 }
 
 #[derive(Clone, Debug)]
@@ -218,16 +221,124 @@ impl Uart16550 {
             color_active: false,
             trace_input: std::env::var("UART_TRACE_INPUT").is_ok(),
             irq_line: false,
+            out_esc_state: 0,
+            in_esc_state: 0,
+            in_esc_buf: Vec::new(),
         }
     }
 
-    fn emit_char(&mut self, ch: u8) {
+    fn emit_raw_char(&mut self, ch: u8) {
         if self.color_enabled && !self.color_active {
-            print!("\x1b[33m");
+            print!("\x1b[38;5;208m");
             self.color_active = true;
         }
         print!("{}", ch as char);
         let _ = io::stdout().flush();
+    }
+
+    fn enqueue_rx(&mut self, ch: u8) {
+        self.rx_fifo.push_back(ch);
+        self.rx_irq_pending = true;
+        if self.trace_input {
+            eprintln!("uart: host->rx byte=0x{:02x}", ch);
+        }
+    }
+
+    fn flush_input_escape_buf(&mut self) {
+        let bytes = std::mem::take(&mut self.in_esc_buf);
+        for b in bytes {
+            self.enqueue_rx(b);
+        }
+    }
+
+    fn handle_input_byte(&mut self, ch: u8) {
+        match self.in_esc_state {
+            0 => {
+                if ch == 0x1b {
+                    self.in_esc_state = 1;
+                    self.in_esc_buf.clear();
+                    self.in_esc_buf.push(ch);
+                } else {
+                    self.enqueue_rx(ch);
+                }
+            }
+            1 => {
+                self.in_esc_buf.push(ch);
+                if ch == b'[' {
+                    self.in_esc_state = 2;
+                } else {
+                    self.in_esc_state = 0;
+                    self.flush_input_escape_buf();
+                }
+            }
+            2 => {
+                self.in_esc_buf.push(ch);
+                if (0x40..=0x7e).contains(&ch) {
+                    let params = &self.in_esc_buf[2..self.in_esc_buf.len() - 1];
+                    let is_cursor_pos_report = ch == b'R'
+                        && !params.is_empty()
+                        && params.iter().all(|b| b.is_ascii_digit() || *b == b';');
+                    self.in_esc_state = 0;
+                    if !is_cursor_pos_report {
+                        self.flush_input_escape_buf();
+                    } else {
+                        self.in_esc_buf.clear();
+                    }
+                } else if self.in_esc_buf.len() > 32 {
+                    self.in_esc_state = 0;
+                    self.flush_input_escape_buf();
+                }
+            }
+            _ => {
+                self.in_esc_state = 0;
+                self.enqueue_rx(ch);
+            }
+        }
+    }
+
+    fn emit_char(&mut self, ch: u8) {
+        match self.out_esc_state {
+            0 => {
+                if ch == 0x1b {
+                    self.out_esc_state = 1;
+                } else {
+                    self.emit_raw_char(ch);
+                }
+            }
+            1 => {
+                if ch == b'[' {
+                    self.out_esc_state = 2;
+                } else {
+                    self.emit_raw_char(0x1b);
+                    self.emit_raw_char(ch);
+                    self.out_esc_state = 0;
+                }
+            }
+            2 => {
+                if ch == b'6' {
+                    self.out_esc_state = 3;
+                } else {
+                    self.emit_raw_char(0x1b);
+                    self.emit_raw_char(b'[');
+                    self.emit_raw_char(ch);
+                    self.out_esc_state = 0;
+                }
+            }
+            3 => {
+                if ch != b'n' {
+                    self.emit_raw_char(0x1b);
+                    self.emit_raw_char(b'[');
+                    self.emit_raw_char(b'6');
+                    self.emit_raw_char(ch);
+                }
+                // Consume ESC[6n cursor query to avoid host terminal response
+                // bytes (e.g. ^[[58;5R) polluting guest console interaction.
+                self.out_esc_state = 0;
+            }
+            _ => {
+                self.out_esc_state = 0;
+            }
+        }
     }
 
     fn set_irq(&mut self, pending: bool) {
@@ -273,21 +384,19 @@ impl Uart16550 {
 
     fn poll_input(&mut self) {
         let mut disconnected = false;
-        if let Some(rx) = self.input_rx.as_ref() {
-            loop {
-                match rx.try_recv() {
-                    Ok(ch) => {
-                        self.rx_fifo.push_back(ch);
-                        self.rx_irq_pending = true;
-                        if self.trace_input {
-                            eprintln!("uart: host->rx byte=0x{:02x}", ch);
-                        }
-                    }
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        disconnected = true;
-                        break;
-                    }
+        loop {
+            let next = match self.input_rx.as_ref() {
+                Some(rx) => rx.try_recv(),
+                None => break,
+            };
+            match next {
+                Ok(ch) => {
+                    self.handle_input_byte(ch);
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
                 }
             }
         }
@@ -328,6 +437,9 @@ impl Uart16550 {
         self.color_enabled = snap.color_enabled;
         self.color_active = snap.color_active;
         self.irq_line = false;
+        self.out_esc_state = 0;
+        self.in_esc_state = 0;
+        self.in_esc_buf.clear();
         self.update_irq_line();
     }
 }

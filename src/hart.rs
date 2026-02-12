@@ -329,10 +329,11 @@ impl Hart {
         self.last_access
     }
 
+    pub fn recent_instrs(&self) -> &[(u64, u32, u8)] {
+        &self.last_instrs
+    }
+
     fn record_instr(&mut self, pc: u64, instr: u32, len: u8) {
-        if !self.trace_last {
-            return;
-        }
         const MAX: usize = 64;
         if self.last_instrs.len() >= MAX {
             self.last_instrs.remove(0);

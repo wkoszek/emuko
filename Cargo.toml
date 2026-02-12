@@ -1,7 +1,28 @@
 [package]
-name = "riscv_sim"
+name = "koriscv"
 version = "0.1.0"
 edition = "2021"
+autobins = false
 
 [dependencies]
 zstd = "0.13"
+
+[[bin]]
+name = "koriscv"
+path = "src/main.rs"
+
+[[bin]]
+name = "riscv_sim"
+path = "src/bin/riscv_sim.rs"
+
+[[bin]]
+name = "koriscvd"
+path = "src/bin/koriscvd.rs"
+
+[[bin]]
+name = "korisc"
+path = "src/bin/korisc.rs"
+
+[[bin]]
+name = "kor"
+path = "src/bin/kor.rs"
