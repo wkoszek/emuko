@@ -479,7 +479,18 @@ impl System {
                 let mut executed = 0u32;
                 {
                     let hart = &mut self.harts[0];
+                    let native_jit_enabled = hart.native_jit_enabled();
                     while executed < batch {
+                        if native_jit_enabled {
+                            let remaining = batch - executed;
+                            if let Some(done) = hart.try_run_native_jit(&mut self.bus, remaining)? {
+                                executed += done;
+                                if self.sbi.shutdown_requested() {
+                                    break;
+                                }
+                                continue;
+                            }
+                        }
                         if let Err(trap) = hart.step(&mut self.bus, &mut self.sbi) {
                             Self::trace_and_handle_trap(&mut self.trace_traps, hart, trap);
                         }

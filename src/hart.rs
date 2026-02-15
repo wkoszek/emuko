@@ -51,6 +51,298 @@ const TLB_PERM_R: u8 = 1 << 0;
 const TLB_PERM_W: u8 = 1 << 1;
 const TLB_PERM_X: u8 = 1 << 2;
 
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct NativeBlockResult {
+    next_pc: u64,
+    executed: u64,
+}
+
+#[derive(Clone, Copy)]
+struct NativeBlock {
+    #[cfg(target_arch = "aarch64")]
+    offset: usize,
+    instrs: u32,
+}
+
+#[cfg(target_arch = "aarch64")]
+type NativeBlockFn = unsafe extern "C" fn(*mut u64) -> NativeBlockResult;
+
+#[cfg(target_arch = "aarch64")]
+struct NativeCodeCache {
+    ptr: *mut u8,
+    size: usize,
+    used: usize,
+}
+
+#[cfg(target_arch = "aarch64")]
+impl NativeCodeCache {
+    fn new(size: usize) -> Option<Self> {
+        use std::ffi::c_void;
+
+        extern "C" {
+            fn mmap(
+                addr: *mut c_void,
+                len: usize,
+                prot: i32,
+                flags: i32,
+                fd: i32,
+                offset: isize,
+            ) -> *mut c_void;
+        }
+
+        const PROT_READ: i32 = 0x1;
+        const PROT_WRITE: i32 = 0x2;
+        const PROT_EXEC: i32 = 0x4;
+        const MAP_PRIVATE: i32 = 0x02;
+        #[cfg(target_os = "macos")]
+        const MAP_ANON: i32 = 0x1000;
+        #[cfg(target_os = "macos")]
+        const MAP_JIT: i32 = 0x0800;
+        #[cfg(not(target_os = "macos"))]
+        const MAP_ANON: i32 = 0x20;
+
+        if size == 0 {
+            return None;
+        }
+
+        // Keep the first implementation simple: one RWX arena for generated blocks.
+        #[cfg(target_os = "macos")]
+        let flags = MAP_PRIVATE | MAP_ANON | MAP_JIT;
+        #[cfg(not(target_os = "macos"))]
+        let flags = MAP_PRIVATE | MAP_ANON;
+
+        let mut p = unsafe {
+            mmap(
+                std::ptr::null_mut(),
+                size,
+                PROT_READ | PROT_WRITE | PROT_EXEC,
+                flags,
+                -1,
+                0,
+            )
+        };
+        #[cfg(target_os = "macos")]
+        if p as isize == -1 {
+            // Some environments deny MAP_JIT; try a best-effort fallback.
+            p = unsafe {
+                mmap(
+                    std::ptr::null_mut(),
+                    size,
+                    PROT_READ | PROT_WRITE | PROT_EXEC,
+                    MAP_PRIVATE | MAP_ANON,
+                    -1,
+                    0,
+                )
+            };
+        }
+        if p as isize == -1 {
+            return None;
+        }
+        Some(Self {
+            ptr: p as *mut u8,
+            size,
+            used: 0,
+        })
+    }
+
+    fn clear(&mut self) {
+        self.used = 0;
+    }
+
+    fn alloc(&mut self, code: &[u8]) -> Option<usize> {
+        let aligned = (self.used + 3) & !3;
+        let end = aligned.checked_add(code.len())?;
+        if end > self.size {
+            return None;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(code.as_ptr(), self.ptr.add(aligned), code.len());
+        }
+        self.flush_icache(aligned, code.len());
+        self.used = end;
+        Some(aligned)
+    }
+
+    fn ptr_at(&self, off: usize) -> *const u8 {
+        unsafe { self.ptr.add(off) as *const u8 }
+    }
+
+    fn flush_icache(&self, off: usize, len: usize) {
+        #[cfg(target_os = "macos")]
+        unsafe {
+            use std::ffi::c_void;
+            extern "C" {
+                fn sys_icache_invalidate(start: *const c_void, len: usize);
+            }
+            sys_icache_invalidate(self.ptr.add(off) as *const c_void, len);
+        }
+        #[cfg(not(target_os = "macos"))]
+        unsafe {
+            extern "C" {
+                fn __clear_cache(start: *mut i8, end: *mut i8);
+            }
+            let start = self.ptr.add(off) as *mut i8;
+            let end = self.ptr.add(off + len) as *mut i8;
+            __clear_cache(start, end);
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+impl Drop for NativeCodeCache {
+    fn drop(&mut self) {
+        use std::ffi::c_void;
+        extern "C" {
+            fn munmap(addr: *mut c_void, len: usize) -> i32;
+        }
+        let _ = unsafe { munmap(self.ptr as *mut c_void, self.size) };
+    }
+}
+
+struct NativeJit {
+    enabled: bool,
+    blocks: HashMap<(u64, u64), NativeBlock>,
+    #[cfg(target_arch = "aarch64")]
+    cache: Option<NativeCodeCache>,
+}
+
+impl NativeJit {
+    fn new(enabled: bool, code_size: usize) -> Self {
+        #[cfg(target_arch = "aarch64")]
+        {
+            let cache = if enabled {
+                NativeCodeCache::new(code_size)
+            } else {
+                None
+            };
+            let ready = cache.is_some();
+            if enabled && !ready {
+                eprintln!("jit-a64: disabled (failed to allocate executable code cache)");
+            }
+            Self {
+                enabled: enabled && ready,
+                blocks: HashMap::new(),
+                cache,
+            }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let _ = code_size;
+            Self {
+                enabled: false,
+                blocks: HashMap::new(),
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.blocks.clear();
+        #[cfg(target_arch = "aarch64")]
+        if let Some(cache) = self.cache.as_mut() {
+            cache.clear();
+        }
+    }
+
+    fn lookup(&self, satp: u64, pc: u64) -> Option<NativeBlock> {
+        self.blocks.get(&(satp, pc)).copied()
+    }
+
+    fn insert(&mut self, satp: u64, pc: u64, block: NativeBlock) {
+        self.blocks.insert((satp, pc), block);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+struct A64Emitter {
+    words: Vec<u32>,
+}
+
+#[cfg(target_arch = "aarch64")]
+impl A64Emitter {
+    fn new() -> Self {
+        Self {
+            words: Vec::with_capacity(256),
+        }
+    }
+
+    #[inline]
+    fn emit(&mut self, w: u32) {
+        self.words.push(w);
+    }
+
+    #[inline]
+    fn ldr_x(rt: u8, rn: u8, off_bytes: u16) -> u32 {
+        let imm12 = (off_bytes as u32) >> 3;
+        0xF940_0000 | (imm12 << 10) | ((rn as u32) << 5) | rt as u32
+    }
+
+    #[inline]
+    fn str_x(rt: u8, rn: u8, off_bytes: u16) -> u32 {
+        let imm12 = (off_bytes as u32) >> 3;
+        0xF900_0000 | (imm12 << 10) | ((rn as u32) << 5) | rt as u32
+    }
+
+    #[inline]
+    fn add_x(rd: u8, rn: u8, rm: u8) -> u32 {
+        0x8B00_0000 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32
+    }
+
+    #[inline]
+    fn sub_x(rd: u8, rn: u8, rm: u8) -> u32 {
+        0xCB00_0000 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32
+    }
+
+    #[inline]
+    fn and_x(rd: u8, rn: u8, rm: u8) -> u32 {
+        0x8A00_0000 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32
+    }
+
+    #[inline]
+    fn orr_x(rd: u8, rn: u8, rm: u8) -> u32 {
+        0xAA00_0000 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32
+    }
+
+    #[inline]
+    fn eor_x(rd: u8, rn: u8, rm: u8) -> u32 {
+        0xCA00_0000 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32
+    }
+
+    #[inline]
+    fn lslv_x(rd: u8, rn: u8, rm: u8) -> u32 {
+        0x9AC0_2000 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32
+    }
+
+    #[inline]
+    fn lsrv_x(rd: u8, rn: u8, rm: u8) -> u32 {
+        0x9AC0_2400 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32
+    }
+
+    #[inline]
+    fn asrv_x(rd: u8, rn: u8, rm: u8) -> u32 {
+        0x9AC0_2800 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32
+    }
+
+    fn mov_imm64(&mut self, rd: u8, val: u64) {
+        let lo = (val & 0xffff) as u32;
+        self.emit(0xD280_0000 | (lo << 5) | rd as u32);
+        for hw in 1..4u32 {
+            let part = ((val >> (hw * 16)) & 0xffff) as u32;
+            if part != 0 {
+                self.emit(0xF280_0000 | (hw << 21) | (part << 5) | rd as u32);
+            }
+        }
+    }
+
+    fn finish(self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.words.len() * 4);
+        for w in self.words {
+            out.extend_from_slice(&w.to_le_bytes());
+        }
+        out
+    }
+}
+
 pub struct Hart {
     pub regs: [u64; 32],
     pub fregs: [u64; 32],
@@ -96,7 +388,10 @@ pub struct Hart {
     fast_tlb_fetch: Option<FastTlbEntry>,
     fast_tlb_load: Option<FastTlbEntry>,
     fast_tlb_store: Option<FastTlbEntry>,
-    jit_enabled: bool,
+    decode_jit_enabled: bool,
+    native_jit_trace: bool,
+    native_jit_probe_printed: bool,
+    native_jit: NativeJit,
     decode_cache: [Option<DecodeCacheEntry>; DECODE_CACHE_SIZE],
 }
 
@@ -202,7 +497,12 @@ impl Hart {
             .unwrap_or(4)
             .max(1);
         let time_jitter_enabled = parse_env_bool("KOR_TIME_JITTER", false);
-        let jit_enabled = parse_env_bool("KOR_JIT", true);
+        let decode_jit_enabled = parse_env_bool("KOR_JIT_DECODE", true);
+        let native_jit_enabled = parse_env_bool("KOR_JIT_NATIVE", false);
+        let native_jit_trace = parse_env_bool("KOR_JIT_NATIVE_TRACE", false);
+        let native_jit_code_size = parse_env_u64("KOR_JIT_NATIVE_CODE_SIZE")
+            .and_then(|v| usize::try_from(v).ok())
+            .unwrap_or(32 * 1024 * 1024);
         let mut time_jitter_state = 0x9E37_79B9_7F4A_7C15u64 ^ ((hart_id as u64) << 32);
         if time_jitter_state == 0 {
             time_jitter_state = 1;
@@ -211,6 +511,13 @@ impl Hart {
             .and_then(|v| u32::try_from(v).ok())
             .unwrap_or(1024)
             .max(1);
+        let native_jit = NativeJit::new(native_jit_enabled, native_jit_code_size);
+        if native_jit_trace {
+            eprintln!(
+                "jit-a64: hart={} enabled={} code_size={} decode_cache={}",
+                hart_id, native_jit.enabled, native_jit_code_size, decode_jit_enabled
+            );
+        }
         Self {
             regs: [0; 32],
             fregs: [0; 32],
@@ -256,7 +563,10 @@ impl Hart {
             fast_tlb_fetch: None,
             fast_tlb_load: None,
             fast_tlb_store: None,
-            jit_enabled,
+            decode_jit_enabled,
+            native_jit_trace,
+            native_jit_probe_printed: false,
+            native_jit,
             decode_cache: [None; DECODE_CACHE_SIZE],
         }
     }
@@ -346,6 +656,7 @@ impl Hart {
         self.fast_tlb_fetch = None;
         self.fast_tlb_load = None;
         self.fast_tlb_store = None;
+        self.native_jit.clear();
     }
 
     #[inline]
@@ -430,7 +741,7 @@ impl Hart {
 
     #[inline]
     fn decode32_cached(&mut self, pc: u64, instr: u32) -> Decoded32 {
-        if !self.jit_enabled {
+        if !self.decode_jit_enabled {
             return Self::decode32(instr);
         }
         let satp = self.satp_cached;
@@ -448,6 +759,317 @@ impl Hart {
             decoded,
         });
         decoded
+    }
+
+    #[inline]
+    fn reg_off(reg: usize) -> u16 {
+        (reg as u16) * 8
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn emit_native_instr(&self, em: &mut A64Emitter, pc: u64, instr: u32, d: Decoded32) -> bool {
+        let rd = d.rd as usize;
+        let rs1 = d.rs1 as usize;
+        let rs2 = d.rs2 as usize;
+        let funct3 = d.funct3 as u32;
+        let funct7 = d.funct7 as u32;
+        let imm12 = d.imm12 as u32;
+        let imm_hi = (imm12 >> 6) & 0x3f;
+
+        let store_rd = |em: &mut A64Emitter, rd: usize| {
+            if rd != 0 {
+                em.emit(A64Emitter::str_x(11, 0, Self::reg_off(rd)));
+            }
+        };
+
+        match d.opcode as u32 {
+            OPCODE_LUI => {
+                if rd != 0 {
+                    em.mov_imm64(11, Self::imm_u(instr) as u64);
+                    em.emit(A64Emitter::str_x(11, 0, Self::reg_off(rd)));
+                }
+                true
+            }
+            OPCODE_AUIPC => {
+                if rd != 0 {
+                    em.mov_imm64(11, pc.wrapping_add(Self::imm_u(instr) as u64));
+                    em.emit(A64Emitter::str_x(11, 0, Self::reg_off(rd)));
+                }
+                true
+            }
+            OPCODE_OP_IMM => {
+                em.emit(A64Emitter::ldr_x(9, 0, Self::reg_off(rs1)));
+                match funct3 {
+                    F3_ADD_SUB => {
+                        em.mov_imm64(10, Self::imm_i(instr) as u64);
+                        em.emit(A64Emitter::add_x(11, 9, 10));
+                    }
+                    F3_XOR => {
+                        em.mov_imm64(10, Self::imm_i(instr) as u64);
+                        em.emit(A64Emitter::eor_x(11, 9, 10));
+                    }
+                    F3_OR => {
+                        em.mov_imm64(10, Self::imm_i(instr) as u64);
+                        em.emit(A64Emitter::orr_x(11, 9, 10));
+                    }
+                    F3_AND => {
+                        em.mov_imm64(10, Self::imm_i(instr) as u64);
+                        em.emit(A64Emitter::and_x(11, 9, 10));
+                    }
+                    F3_SLL => {
+                        if imm_hi != 0 {
+                            return false;
+                        }
+                        em.mov_imm64(10, (imm12 & 0x3f) as u64);
+                        em.emit(A64Emitter::lslv_x(11, 9, 10));
+                    }
+                    F3_SRL_SRA => {
+                        em.mov_imm64(10, (imm12 & 0x3f) as u64);
+                        match imm_hi {
+                            0x00 => em.emit(A64Emitter::lsrv_x(11, 9, 10)),
+                            0x10 => em.emit(A64Emitter::asrv_x(11, 9, 10)),
+                            _ => return false,
+                        }
+                    }
+                    _ => return false,
+                }
+                store_rd(em, rd);
+                true
+            }
+            OPCODE_OP => {
+                em.emit(A64Emitter::ldr_x(9, 0, Self::reg_off(rs1)));
+                em.emit(A64Emitter::ldr_x(10, 0, Self::reg_off(rs2)));
+                match (funct7, funct3) {
+                    (F7_BASE, F3_ADD_SUB) => em.emit(A64Emitter::add_x(11, 9, 10)),
+                    (F7_SUB_SRA, F3_ADD_SUB) => em.emit(A64Emitter::sub_x(11, 9, 10)),
+                    (F7_BASE, F3_AND) => em.emit(A64Emitter::and_x(11, 9, 10)),
+                    (F7_BASE, F3_OR) => em.emit(A64Emitter::orr_x(11, 9, 10)),
+                    (F7_BASE, F3_XOR) => em.emit(A64Emitter::eor_x(11, 9, 10)),
+                    (F7_BASE, F3_SLL) => em.emit(A64Emitter::lslv_x(11, 9, 10)),
+                    (F7_BASE, F3_SRL_SRA) => em.emit(A64Emitter::lsrv_x(11, 9, 10)),
+                    (F7_SUB_SRA, F3_SRL_SRA) => em.emit(A64Emitter::asrv_x(11, 9, 10)),
+                    _ => return false,
+                }
+                store_rd(em, rd);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    fn emit_native_instr(&self, _em: &mut (), _pc: u64, _instr: u32, _d: Decoded32) -> bool {
+        false
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn compile_native_block(
+        &mut self,
+        bus: &mut impl Bus,
+        max_steps: u32,
+    ) -> Result<Option<NativeBlock>, Trap> {
+        if !self.native_jit.enabled {
+            return Ok(None);
+        }
+        if self.native_jit_trace {
+            eprintln!(
+                "jit-a64: compile-enter pc=0x{:016x} max_steps={}",
+                self.pc, max_steps
+            );
+        }
+        let max_steps = max_steps.min(64);
+        if max_steps < 1 {
+            return Ok(None);
+        }
+        let satp = self.satp_cached;
+        let start_pc = self.pc;
+        let mut pc = start_pc;
+        let mut emitted = 0u32;
+        let mut em = A64Emitter::new();
+
+        while emitted < max_steps {
+            if (pc & 0x3) != 0 {
+                if emitted == 0 {
+                    self.check_align(pc, 4)?;
+                }
+                break;
+            }
+            let instr = match self.read_u32(bus, pc, AccessType::Fetch) {
+                Ok(v) => v,
+                Err(t) => {
+                    if emitted == 0 {
+                        if self.native_jit_trace {
+                            eprintln!(
+                                "jit-a64: skip pc=0x{:016x} fetch-trap={:?}",
+                                pc, t
+                            );
+                        }
+                        return Err(t);
+                    }
+                    break;
+                }
+            };
+            if (instr & 0x3) != 0x3 {
+                if emitted == 0 && self.native_jit_trace {
+                    eprintln!(
+                        "jit-a64: skip pc=0x{:016x} compressed instr16=0x{:04x}",
+                        pc,
+                        (instr & 0xffff) as u16
+                    );
+                }
+                break;
+            }
+            let d = Self::decode32(instr);
+            if !self.emit_native_instr(&mut em, pc, instr, d) {
+                if emitted == 0 && self.native_jit_trace {
+                    eprintln!(
+                        "jit-a64: skip pc=0x{:016x} unsupported i32=0x{:08x}",
+                        pc, instr
+                    );
+                }
+                break;
+            }
+            pc = pc.wrapping_add(4);
+            emitted += 1;
+        }
+
+        if emitted < 1 {
+            return Ok(None);
+        }
+
+        em.mov_imm64(0, pc);
+        em.mov_imm64(1, emitted as u64);
+        em.emit(0xD65F_03C0); // ret
+        let code = em.finish();
+
+        let Some(cache) = self.native_jit.cache.as_mut() else {
+            if self.native_jit_trace {
+                eprintln!("jit-a64: disable (missing executable cache)");
+            }
+            self.native_jit.enabled = false;
+            return Ok(None);
+        };
+        let Some(offset) = cache.alloc(&code) else {
+            if self.native_jit_trace {
+                eprintln!(
+                    "jit-a64: disable (code cache full/alloc failed, used={} size={} block_bytes={})",
+                    cache.used,
+                    cache.size,
+                    code.len()
+                );
+            }
+            self.native_jit.enabled = false;
+            return Ok(None);
+        };
+        let block = NativeBlock {
+            offset,
+            instrs: emitted,
+        };
+        self.native_jit.insert(satp, start_pc, block);
+        if self.native_jit_trace {
+            eprintln!(
+                "jit-a64: compiled hart={} satp=0x{:016x} pc=0x{:016x} instrs={}",
+                self.hart_id, satp, start_pc, emitted
+            );
+        }
+        Ok(Some(block))
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    fn compile_native_block(
+        &mut self,
+        _bus: &mut impl Bus,
+        _max_steps: u32,
+    ) -> Result<Option<NativeBlock>, Trap> {
+        Ok(None)
+    }
+
+    pub fn try_run_native_jit(
+        &mut self,
+        bus: &mut impl Bus,
+        max_steps: u32,
+    ) -> Result<Option<u32>, Trap> {
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let _ = (bus, max_steps);
+            return Ok(None);
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            if self.native_jit_trace && !self.native_jit_probe_printed {
+                self.native_jit_probe_printed = true;
+                eprintln!(
+                    "jit-a64: probe pc=0x{:016x} max_steps={} irq_cd={} debug_hooks={} jitter={} enabled={}",
+                    self.pc,
+                    max_steps,
+                    self.irq_check_countdown,
+                    self.has_debug_hooks(),
+                    self.time_jitter_enabled,
+                    self.native_jit.enabled
+                );
+            }
+            if !self.native_jit.enabled || max_steps < 2 || self.has_debug_hooks() {
+                return Ok(None);
+            }
+            if self.time_jitter_enabled {
+                return Ok(None);
+            }
+            if (self.pc & 0x3) != 0 {
+                return Ok(None);
+            }
+            if self.irq_check_countdown <= 1 {
+                return Ok(None);
+            }
+            let budget = max_steps.min(self.irq_check_countdown.saturating_sub(1));
+            if budget < 1 {
+                return Ok(None);
+            }
+
+            let satp = self.satp_cached;
+            let start_pc = self.pc;
+            let mut block = self.native_jit.lookup(satp, start_pc);
+            if block.is_none() {
+                block = self.compile_native_block(bus, budget)?;
+            }
+            let Some(block) = block else {
+                return Ok(None);
+            };
+            if block.instrs < 1 || block.instrs > budget {
+                return Ok(None);
+            }
+
+            let Some(cache) = self.native_jit.cache.as_ref() else {
+                self.native_jit.enabled = false;
+                return Ok(None);
+            };
+            let fn_ptr = cache.ptr_at(block.offset);
+            let func: NativeBlockFn = unsafe { std::mem::transmute(fn_ptr) };
+            let res = unsafe { func(self.regs.as_mut_ptr()) };
+            if res.executed != block.instrs as u64 || res.executed == 0 {
+                return Ok(None);
+            }
+
+            let done = res.executed as u32;
+            self.pc = res.next_pc;
+            self.regs[0] = 0;
+            self.instret_pending = self.instret_pending.wrapping_add(done as u64);
+
+            let total = self.time_div_accum.saturating_add(done);
+            if total >= self.time_divider {
+                let ticks = total / self.time_divider;
+                self.time_div_accum = total % self.time_divider;
+                self.csrs.increment_time(ticks as u64);
+            } else {
+                self.time_div_accum = total;
+            }
+            self.irq_check_countdown = self.irq_check_countdown.saturating_sub(done);
+            Ok(Some(done))
+        }
+    }
+
+    #[inline]
+    pub fn native_jit_enabled(&self) -> bool {
+        self.native_jit.enabled
     }
 
     pub fn reset(&mut self, pc: u64, sp: u64, gp: u64) {
