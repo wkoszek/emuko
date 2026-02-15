@@ -98,7 +98,7 @@ fn parse_opts() -> DaemonOpts {
             .to_string();
     let mut addr = "127.0.0.1:7788".to_string();
     let mut snapshot_dir = "/tmp/korisc5".to_string();
-    let mut chunk_steps = 50_000u64;
+    let mut chunk_steps = 1_000_000u64;
     let mut autostart = false;
     let mut positionals = Vec::new();
 
@@ -562,7 +562,11 @@ fn handle_path(path: &str, st: &mut DaemonState) -> (u16, String, &'static str) 
             );
         };
         let Some(part2) = it.next() else {
-            return (400, "{\"error\":\"missing value\"}".to_string(), "application/json");
+            return (
+                400,
+                "{\"error\":\"missing value\"}".to_string(),
+                "application/json",
+            );
         };
         let value_s = if part2 == "value" {
             let Some(v) = it.next() else {
@@ -764,7 +768,11 @@ fn run_loop(mut st: DaemonState, addr: &str) -> Result<(), String> {
             }
         }
         pump_console_input(&mut st, &stdin_rx);
-        std::thread::sleep(Duration::from_millis(if st.running { 1 } else { 3 }));
+        if st.running {
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(Duration::from_millis(3));
+        }
     }
 }
 

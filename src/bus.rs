@@ -1,5 +1,7 @@
+use crate::dev::Ram;
 use crate::trap::Trap;
 use std::any::Any;
+use std::ptr::NonNull;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccessType {
@@ -78,6 +80,11 @@ pub trait Device {
     fn read(&mut self, addr: u64, size: usize) -> Result<u64, Trap>;
     fn write(&mut self, addr: u64, size: usize, value: u64) -> Result<(), Trap>;
     fn tick(&mut self) {}
+    fn tick_n(&mut self, n: u32) {
+        for _ in 0..n {
+            self.tick();
+        }
+    }
     fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
@@ -91,13 +98,36 @@ struct DeviceRegion {
 pub struct Interconnect {
     devices: Vec<DeviceRegion>,
     stats: BusStats,
+    stats_enabled: bool,
+    ram_idx: Option<usize>,
+    ram_base: u64,
+    ram_size: u64,
+    ram_ptr: Option<NonNull<Ram>>,
+    uart_idx: Option<usize>,
 }
 
 impl Interconnect {
+    fn env_flag(name: &str, default: bool) -> bool {
+        match std::env::var(name) {
+            Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => true,
+                "0" | "false" | "no" | "off" => false,
+                _ => default,
+            },
+            Err(_) => default,
+        }
+    }
+
     pub fn new(num_harts: usize) -> Self {
         Self {
             devices: Vec::new(),
             stats: BusStats::new(num_harts),
+            stats_enabled: Self::env_flag("KOR_ENABLE_BUS_STATS", false),
+            ram_idx: None,
+            ram_base: 0,
+            ram_size: 0,
+            ram_ptr: None,
+            uart_idx: None,
         }
     }
 
@@ -109,16 +139,26 @@ impl Interconnect {
         dev: Box<dyn Device>,
     ) -> usize {
         let idx = self.devices.len();
+        let name = name.into();
         self.devices.push(DeviceRegion {
             base,
             size,
-            name: name.into(),
+            name: name.clone(),
             dev,
         });
         self.stats.per_device.push(DeviceStats {
-            name: self.devices[idx].name.clone(),
+            name: name.clone(),
             counter: Counter::default(),
         });
+        if name == "ram" {
+            self.ram_idx = Some(idx);
+            self.ram_base = base;
+            self.ram_size = size;
+            let ram = self.devices[idx].dev.as_any_mut().downcast_mut::<Ram>();
+            self.ram_ptr = ram.map(NonNull::from);
+        } else if name == "uart" {
+            self.uart_idx = Some(idx);
+        }
         idx
     }
 
@@ -138,6 +178,22 @@ impl Interconnect {
     }
 
     fn read(&mut self, hart: usize, addr: u64, size: usize, kind: AccessType) -> Result<u64, Trap> {
+        if let (Some(ram_idx), Some(mut ram_ptr)) = (self.ram_idx, self.ram_ptr) {
+            if addr >= self.ram_base {
+                let off = addr - self.ram_base;
+                if let Some(end) = off.checked_add(size as u64) {
+                    if end <= self.ram_size {
+                        // SAFETY: ram_ptr is created from the owned RAM device and remains valid
+                        // for the Interconnect lifetime.
+                        let value = unsafe { ram_ptr.as_mut().read_fast(off as usize, size)? };
+                        if self.stats_enabled {
+                            self.stats.record(hart, ram_idx, kind, size as u64);
+                        }
+                        return Ok(value);
+                    }
+                }
+            }
+        }
         let dev_idx = self
             .find_device(addr, size)
             .ok_or(Trap::MemoryOutOfBounds {
@@ -146,7 +202,9 @@ impl Interconnect {
             })?;
         let dev = &mut self.devices[dev_idx];
         let value = dev.dev.read(addr - dev.base, size)?;
-        self.stats.record(hart, dev_idx, kind, size as u64);
+        if self.stats_enabled {
+            self.stats.record(hart, dev_idx, kind, size as u64);
+        }
         Ok(value)
     }
 
@@ -158,6 +216,22 @@ impl Interconnect {
         value: u64,
         kind: AccessType,
     ) -> Result<(), Trap> {
+        if let (Some(ram_idx), Some(mut ram_ptr)) = (self.ram_idx, self.ram_ptr) {
+            if addr >= self.ram_base {
+                let off = addr - self.ram_base;
+                if let Some(end) = off.checked_add(size as u64) {
+                    if end <= self.ram_size {
+                        // SAFETY: ram_ptr is created from the owned RAM device and remains valid
+                        // for the Interconnect lifetime.
+                        unsafe { ram_ptr.as_mut().write_fast(off as usize, size, value)? };
+                        if self.stats_enabled {
+                            self.stats.record(hart, ram_idx, kind, size as u64);
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+        }
         let dev_idx = self
             .find_device(addr, size)
             .ok_or(Trap::MemoryOutOfBounds {
@@ -166,7 +240,9 @@ impl Interconnect {
             })?;
         let dev = &mut self.devices[dev_idx];
         dev.dev.write(addr - dev.base, size, value)?;
-        self.stats.record(hart, dev_idx, kind, size as u64);
+        if self.stats_enabled {
+            self.stats.record(hart, dev_idx, kind, size as u64);
+        }
         Ok(())
     }
 
@@ -175,9 +251,23 @@ impl Interconnect {
         dev.dev.as_any_mut().downcast_mut::<T>()
     }
 
+    #[allow(dead_code)]
     pub fn tick_devices(&mut self) {
         for dev in &mut self.devices {
             dev.dev.tick();
+        }
+    }
+
+    pub fn tick_devices_n(&mut self, n: u32) {
+        if n == 0 {
+            return;
+        }
+        for (idx, dev) in self.devices.iter_mut().enumerate() {
+            if Some(idx) == self.uart_idx {
+                dev.dev.tick_n(n);
+            } else {
+                dev.dev.tick();
+            }
         }
     }
 }

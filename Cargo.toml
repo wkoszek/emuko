@@ -26,3 +26,10 @@ path = "src/bin/korisc.rs"
 [[bin]]
 name = "kor"
 path = "src/bin/kor.rs"
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+panic = "abort"
+incremental = false
+strip = "debuginfo"

@@ -43,6 +43,13 @@ pub struct System {
     perf_report_interval: Duration,
     perf_check_ticks: u32,
     perf_check_countdown: u32,
+    device_tick_stride: u32,
+    device_tick_pending: u32,
+    irq_poll_stride: u32,
+    irq_poll_pending: u32,
+    time_divider: u32,
+    time_div_accum: u32,
+    run_batch_steps: u32,
 }
 
 impl System {
@@ -112,12 +119,92 @@ impl System {
         self.perf_reports_left = self.perf_reports_left.saturating_sub(1);
     }
 
-    fn perf_tick(&mut self) {
-        if self.perf_check_countdown <= 1 {
-            self.perf_check_countdown = self.perf_check_ticks;
-            self.maybe_report_perf();
-        } else {
-            self.perf_check_countdown -= 1;
+    fn perf_tick_n(&mut self, n: u32) {
+        if n == 0 {
+            return;
+        }
+        if self.perf_reports_left == 0 {
+            if self.perf_check_countdown > n {
+                self.perf_check_countdown -= n;
+            } else {
+                self.perf_check_countdown = self.perf_check_ticks;
+            }
+            return;
+        }
+        let mut remaining = n;
+        while remaining > 0 {
+            if remaining >= self.perf_check_countdown {
+                remaining -= self.perf_check_countdown;
+                self.perf_check_countdown = self.perf_check_ticks;
+                self.maybe_report_perf();
+                if self.perf_reports_left == 0 {
+                    break;
+                }
+            } else {
+                self.perf_check_countdown -= remaining;
+                break;
+            }
+        }
+    }
+
+    fn refresh_interrupt_state(&mut self) {
+        let now = self.sbi.time();
+        for hart in &mut self.harts {
+            hart.csrs.set_time(now);
+            let due = self.sbi.timer_due(hart.hart_id);
+            let mut sip = hart.csrs.read(crate::csr::CSR_SIP);
+            if due {
+                sip |= crate::csr::SIP_STIP;
+            } else {
+                sip &= !crate::csr::SIP_STIP;
+            }
+            let ssip = self.clint.borrow().software_pending(hart.hart_id);
+            if ssip {
+                sip |= crate::csr::SIP_SSIP;
+            } else {
+                sip &= !crate::csr::SIP_SSIP;
+            }
+            let seip = self.plic.borrow().pending_for_hart(hart.hart_id);
+            if seip {
+                sip |= crate::csr::SIP_SEIP;
+            } else {
+                sip &= !crate::csr::SIP_SEIP;
+            }
+            hart.csrs.write(crate::csr::CSR_SIP, sip);
+        }
+    }
+
+    fn flush_runtime_housekeeping(&mut self) {
+        if self.device_tick_pending > 0 {
+            self.bus.tick_devices_n(self.device_tick_pending);
+            self.device_tick_pending = 0;
+        }
+        if self.irq_poll_pending > 0 {
+            let total = self.time_div_accum as u64 + self.irq_poll_pending as u64;
+            let ticks = total / self.time_divider as u64;
+            self.time_div_accum = (total % self.time_divider as u64) as u32;
+            if ticks > 0 {
+                self.sbi.tick(ticks);
+            }
+            self.irq_poll_pending = 0;
+            self.refresh_interrupt_state();
+        }
+    }
+
+    fn maybe_runtime_housekeeping(&mut self) {
+        if self.device_tick_pending >= self.device_tick_stride {
+            self.bus.tick_devices_n(self.device_tick_pending);
+            self.device_tick_pending = 0;
+        }
+        if self.irq_poll_pending >= self.irq_poll_stride {
+            let total = self.time_div_accum as u64 + self.irq_poll_pending as u64;
+            let ticks = total / self.time_divider as u64;
+            self.time_div_accum = (total % self.time_divider as u64) as u32;
+            if ticks > 0 {
+                self.sbi.tick(ticks);
+            }
+            self.irq_poll_pending = 0;
+            self.refresh_interrupt_state();
         }
     }
 
@@ -160,6 +247,10 @@ impl System {
                 .filter(|v| *v > 0.0)
                 .unwrap_or(1.0),
         );
+        let device_tick_stride = Self::env_u32("KOR_DEVICE_TICK_STRIDE", 256).max(1);
+        let irq_poll_stride = Self::env_u32("KOR_IRQ_POLL_STRIDE", 256).max(1);
+        let time_divider = Self::env_u32("KOR_TIME_DIVIDER", 4).max(1);
+        let run_batch_steps = Self::env_u32("KOR_RUN_BATCH_STEPS", 16_384).max(1);
 
         Self {
             bus,
@@ -181,6 +272,13 @@ impl System {
             perf_report_interval,
             perf_check_ticks,
             perf_check_countdown: perf_check_ticks,
+            device_tick_stride,
+            device_tick_pending: 0,
+            irq_poll_stride,
+            irq_poll_pending: 0,
+            time_divider,
+            time_div_accum: 0,
+            run_batch_steps,
         }
     }
 
@@ -262,7 +360,7 @@ impl System {
             hart.regs[12] = 0;
             hart.regs[13] = 0;
             hart.regs[4] = hart.hart_id as u64; // tp: some boot flows expect hartid here.
-            hart.csrs.write(crate::csr::CSR_SATP, 0);
+            hart.set_satp(0);
         }
     }
 
@@ -279,7 +377,7 @@ impl System {
             hart.regs[12] = 0;
             hart.regs[13] = 0;
             hart.regs[4] = hart.hart_id as u64; // tp
-            hart.csrs.write(crate::csr::CSR_SATP, 0);
+            hart.set_satp(0);
         }
     }
 
@@ -304,6 +402,7 @@ impl System {
         self.perf_last_report_steps = 0;
         self.perf_reports_left = self.perf_report_count_cfg;
         self.perf_check_countdown = self.perf_check_ticks;
+        self.time_div_accum = 0;
     }
 
     pub fn load(&mut self, addr: u64, data: &[u8]) -> Result<(), Trap> {
@@ -327,9 +426,89 @@ impl System {
         Ok(())
     }
 
+    fn trace_and_handle_trap(trace_traps: &mut Option<u64>, hart: &mut Hart, trap: Trap) {
+        if let Some(left) = trace_traps.as_mut() {
+            if *left > 0 {
+                eprintln!("trap hart={} pc=0x{:016x} {:?}", hart.hart_id, hart.pc, trap);
+                if let Some((kind, addr, size)) = hart.last_access() {
+                    eprintln!(
+                        "  last_access kind={:?} addr=0x{:016x} size={}",
+                        kind, addr, size
+                    );
+                }
+                eprintln!(
+                    "  regs a0=0x{:016x} a1=0x{:016x} a2=0x{:016x} a3=0x{:016x}",
+                    hart.regs[10], hart.regs[11], hart.regs[12], hart.regs[13]
+                );
+                eprintln!(
+                    "  satp=0x{:016x} sstatus=0x{:016x} sepc=0x{:016x} scause=0x{:016x} stval=0x{:016x}",
+                    hart.csrs.read(crate::csr::CSR_SATP),
+                    hart.csrs.read(crate::csr::CSR_SSTATUS),
+                    hart.csrs.read(crate::csr::CSR_SEPC),
+                    hart.csrs.read(crate::csr::CSR_SCAUSE),
+                    hart.csrs.read(crate::csr::CSR_STVAL)
+                );
+                *left -= 1;
+            }
+        }
+        hart.handle_trap(trap);
+    }
+
     pub fn run(&mut self, max_steps: Option<u64>) -> Result<u64, Trap> {
         self.ensure_perf_tracking_started();
+        self.device_tick_pending = 0;
+        self.irq_poll_pending = 0;
+        self.time_div_accum = 0;
+        self.refresh_interrupt_state();
         let mut steps = 0u64;
+        if self.harts.len() == 1 {
+            loop {
+                if let Some(limit) = max_steps {
+                    if steps >= limit {
+                        break;
+                    }
+                }
+                let mut batch = self.run_batch_steps;
+                if let Some(limit) = max_steps {
+                    let remaining = limit.saturating_sub(steps);
+                    if remaining == 0 {
+                        break;
+                    }
+                    batch = batch.min(remaining as u32);
+                }
+                let mut executed = 0u32;
+                {
+                    let hart = &mut self.harts[0];
+                    while executed < batch {
+                        if let Err(trap) = hart.step(&mut self.bus, &mut self.sbi) {
+                            Self::trace_and_handle_trap(&mut self.trace_traps, hart, trap);
+                        }
+                        executed += 1;
+                        if self.sbi.shutdown_requested() {
+                            break;
+                        }
+                    }
+                }
+                if executed == 0 {
+                    break;
+                }
+                let executed_u64 = executed as u64;
+                steps = steps.wrapping_add(executed_u64);
+                self.total_steps = self.total_steps.wrapping_add(executed_u64);
+                self.device_tick_pending = self.device_tick_pending.saturating_add(executed);
+                self.irq_poll_pending = self.irq_poll_pending.saturating_add(executed);
+                self.maybe_runtime_housekeeping();
+                self.perf_tick_n(executed);
+                if self.sbi.shutdown_requested() {
+                    self.flush_runtime_housekeeping();
+                    self.maybe_report_perf();
+                    return Ok(steps);
+                }
+            }
+            self.flush_runtime_housekeeping();
+            self.maybe_report_perf();
+            return Ok(steps);
+        }
         loop {
             if let Some(limit) = max_steps {
                 if steps >= limit {
@@ -342,74 +521,26 @@ impl System {
                         break;
                     }
                 }
-                self.bus.tick_devices();
                 {
                     let hart = &mut self.harts[hart_idx];
                     if let Err(trap) = hart.step(&mut self.bus, &mut self.sbi) {
-                        if let Some(left) = self.trace_traps.as_mut() {
-                            if *left > 0 {
-                                eprintln!(
-                                    "trap hart={} pc=0x{:016x} {:?}",
-                                    hart.hart_id, hart.pc, trap
-                                );
-                                if let Some((kind, addr, size)) = hart.last_access() {
-                                    eprintln!(
-                                        "  last_access kind={:?} addr=0x{:016x} size={}",
-                                        kind, addr, size
-                                    );
-                                }
-                                eprintln!(
-                                    "  regs a0=0x{:016x} a1=0x{:016x} a2=0x{:016x} a3=0x{:016x}",
-                                    hart.regs[10], hart.regs[11], hart.regs[12], hart.regs[13]
-                                );
-                                eprintln!(
-                                    "  satp=0x{:016x} sstatus=0x{:016x} sepc=0x{:016x} scause=0x{:016x} stval=0x{:016x}",
-                                    hart.csrs.read(crate::csr::CSR_SATP),
-                                    hart.csrs.read(crate::csr::CSR_SSTATUS),
-                                    hart.csrs.read(crate::csr::CSR_SEPC),
-                                    hart.csrs.read(crate::csr::CSR_SCAUSE),
-                                    hart.csrs.read(crate::csr::CSR_STVAL)
-                                );
-                                *left -= 1;
-                            }
-                        }
-                        hart.handle_trap(trap);
-                    }
-                    self.sbi.tick(1);
-                    let now = self.sbi.time();
-                    hart.csrs.set_time(now);
-                    {
-                        let due = self.sbi.timer_due(hart.hart_id);
-                        let mut sip = hart.csrs.read(crate::csr::CSR_SIP);
-                        if due {
-                            sip |= crate::csr::SIP_STIP;
-                        } else {
-                            sip &= !crate::csr::SIP_STIP;
-                        }
-                        let ssip = self.clint.borrow().software_pending(hart.hart_id);
-                        if ssip {
-                            sip |= crate::csr::SIP_SSIP;
-                        } else {
-                            sip &= !crate::csr::SIP_SSIP;
-                        }
-                        let seip = self.plic.borrow().pending_for_hart(hart.hart_id);
-                        if seip {
-                            sip |= crate::csr::SIP_SEIP;
-                        } else {
-                            sip &= !crate::csr::SIP_SEIP;
-                        }
-                        hart.csrs.write(crate::csr::CSR_SIP, sip);
+                        Self::trace_and_handle_trap(&mut self.trace_traps, hart, trap);
                     }
                 }
                 steps += 1;
                 self.total_steps = self.total_steps.wrapping_add(1);
-                self.perf_tick();
+                self.device_tick_pending = self.device_tick_pending.saturating_add(1);
+                self.irq_poll_pending = self.irq_poll_pending.saturating_add(1);
+                self.maybe_runtime_housekeeping();
+                self.perf_tick_n(1);
                 if self.sbi.shutdown_requested() {
+                    self.flush_runtime_housekeeping();
                     self.maybe_report_perf();
                     return Ok(steps);
                 }
             }
         }
+        self.flush_runtime_housekeeping();
         self.maybe_report_perf();
         Ok(steps)
     }

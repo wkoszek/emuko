@@ -106,8 +106,24 @@ impl CsrFile {
         self.regs[CSR_CYCLE as usize] = time;
     }
 
+    #[inline]
+    pub fn increment_time(&mut self, delta: u64) {
+        let time = self.regs[CSR_TIME as usize].wrapping_add(delta);
+        self.regs[CSR_TIME as usize] = time;
+        self.regs[CSR_CYCLE as usize] = time;
+    }
+
     pub fn increment_instret(&mut self) {
         let val = self.regs[CSR_INSTRET as usize].wrapping_add(1);
+        self.regs[CSR_INSTRET as usize] = val;
+    }
+
+    #[inline]
+    pub fn increment_instret_n(&mut self, delta: u64) {
+        if delta == 0 {
+            return;
+        }
+        let val = self.regs[CSR_INSTRET as usize].wrapping_add(delta);
         self.regs[CSR_INSTRET as usize] = val;
     }
 

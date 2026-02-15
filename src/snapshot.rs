@@ -11,7 +11,7 @@ use std::fs::File;
 use std::io::{BufWriter, Cursor, Read, Write};
 
 const MAGIC: &[u8; 8] = b"KRSVSNP1";
-const VERSION: u32 = 3;
+const VERSION: u32 = 6;
 
 #[derive(Clone, Debug)]
 pub struct MachineSnapshot {
@@ -291,6 +291,7 @@ pub fn save(path: &str, snap: &MachineSnapshot) -> Result<(), String> {
             w.write_u64(v)?;
         }
         w.write_opt_u64(hart.reservation)?;
+        w.write_u64(hart.instret_pending)?;
         if let Some((kind, addr, size)) = hart.last_access {
             w.write_bool(true)?;
             w.write_u8(access_to_u8(kind))?;
@@ -304,6 +305,8 @@ pub fn save(path: &str, snap: &MachineSnapshot) -> Result<(), String> {
         w.write_u64(hart.watch_left)?;
         w.write_u64(hart.watch_left2)?;
         w.write_u64(hart.mmu_trace_left)?;
+        w.write_u32(hart.time_div_accum)?;
+        w.write_u64(hart.time_jitter_state)?;
         w.write_len_u32(hart.csrs.regs.len())?;
         for csr in &hart.csrs.regs {
             w.write_u64(*csr)?;
@@ -407,7 +410,7 @@ pub fn load(path: &str) -> Result<MachineSnapshot, String> {
         return Err("invalid snapshot magic".to_string());
     }
     let ver = r.read_u32()?;
-    if ver != 1 && ver != 2 && ver != VERSION {
+    if ver != 1 && ver != 2 && ver != 3 && ver != 4 && ver != 5 && ver != VERSION {
         return Err(format!("unsupported snapshot version {}", ver));
     }
 
@@ -435,6 +438,7 @@ pub fn load(path: &str) -> Result<MachineSnapshot, String> {
             *v = r.read_u64()?;
         }
         let reservation = r.read_opt_u64()?;
+        let instret_pending = if ver >= 6 { r.read_u64()? } else { 0 };
         let last_access = if r.read_bool()? {
             Some((u8_to_access(r.read_u8()?)?, r.read_u64()?, r.read_u64()?))
         } else {
@@ -445,6 +449,12 @@ pub fn load(path: &str) -> Result<MachineSnapshot, String> {
         let watch_left = r.read_u64()?;
         let watch_left2 = r.read_u64()?;
         let mmu_trace_left = r.read_u64()?;
+        let time_div_accum = if ver >= 5 { r.read_u32()? } else { 0 };
+        let time_jitter_state = if ver >= 4 {
+            r.read_u64()?
+        } else {
+            0x9E37_79B9_7F4A_7C15u64 ^ ((hart_id as u64) << 32)
+        };
         let csr_len = r.read_len_u32()?;
         let mut csr_regs = Vec::with_capacity(csr_len);
         for _ in 0..csr_len {
@@ -459,12 +469,15 @@ pub fn load(path: &str) -> Result<MachineSnapshot, String> {
             csrs: crate::csr::CsrSnapshot { regs: csr_regs },
             misa_ext,
             reservation,
+            instret_pending,
             last_access,
             trace_instr,
             trace_pc_left,
             watch_left,
             watch_left2,
             mmu_trace_left,
+            time_div_accum,
+            time_jitter_state,
         });
     }
 

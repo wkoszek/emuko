@@ -57,77 +57,67 @@ impl Ram {
         self.data.copy_from_slice(&snap.data);
         Ok(())
     }
+
+    #[inline]
+    pub fn read_fast(&mut self, idx: usize, size: usize) -> Result<u64, Trap> {
+        let p = self.data.as_ptr();
+        // SAFETY: caller guarantees idx..idx+size is in bounds.
+        let val = unsafe {
+            match size {
+                1 => *p.add(idx) as u64,
+                2 => std::ptr::read_unaligned(p.add(idx) as *const u16) as u64,
+                4 => std::ptr::read_unaligned(p.add(idx) as *const u32) as u64,
+                8 => std::ptr::read_unaligned(p.add(idx) as *const u64),
+                _ => {
+                    return Err(Trap::MemoryOutOfBounds {
+                        addr: 0,
+                        size: size as u64,
+                    })
+                }
+            }
+        };
+        Ok(u64::from_le(val))
+    }
+
+    #[inline]
+    pub fn write_fast(&mut self, idx: usize, size: usize, value: u64) -> Result<(), Trap> {
+        let p = self.data.as_mut_ptr();
+        // SAFETY: caller guarantees idx..idx+size is in bounds.
+        unsafe {
+            match size {
+                1 => *p.add(idx) = value as u8,
+                2 => std::ptr::write_unaligned(p.add(idx) as *mut u16, (value as u16).to_le()),
+                4 => std::ptr::write_unaligned(p.add(idx) as *mut u32, (value as u32).to_le()),
+                8 => std::ptr::write_unaligned(p.add(idx) as *mut u64, value.to_le()),
+                _ => {
+                    return Err(Trap::MemoryOutOfBounds {
+                        addr: 0,
+                        size: size as u64,
+                    })
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Device for Ram {
     fn read(&mut self, addr: u64, size: usize) -> Result<u64, Trap> {
         let idx = self.check(addr, size)?;
-        let val = match size {
-            1 => self.data[idx] as u64,
-            2 => u16::from_le_bytes([self.data[idx], self.data[idx + 1]]) as u64,
-            4 => u32::from_le_bytes([
-                self.data[idx],
-                self.data[idx + 1],
-                self.data[idx + 2],
-                self.data[idx + 3],
-            ]) as u64,
-            8 => u64::from_le_bytes([
-                self.data[idx],
-                self.data[idx + 1],
-                self.data[idx + 2],
-                self.data[idx + 3],
-                self.data[idx + 4],
-                self.data[idx + 5],
-                self.data[idx + 6],
-                self.data[idx + 7],
-            ]),
-            _ => {
-                return Err(Trap::MemoryOutOfBounds {
-                    addr,
-                    size: size as u64,
-                })
-            }
-        };
-        Ok(val)
+        self.read_fast(idx, size)
+            .map_err(|_| Trap::MemoryOutOfBounds {
+                addr,
+                size: size as u64,
+            })
     }
 
     fn write(&mut self, addr: u64, size: usize, value: u64) -> Result<(), Trap> {
         let idx = self.check(addr, size)?;
-        match size {
-            1 => {
-                self.data[idx] = value as u8;
-            }
-            2 => {
-                let bytes = (value as u16).to_le_bytes();
-                self.data[idx] = bytes[0];
-                self.data[idx + 1] = bytes[1];
-            }
-            4 => {
-                let bytes = (value as u32).to_le_bytes();
-                self.data[idx] = bytes[0];
-                self.data[idx + 1] = bytes[1];
-                self.data[idx + 2] = bytes[2];
-                self.data[idx + 3] = bytes[3];
-            }
-            8 => {
-                let bytes = value.to_le_bytes();
-                self.data[idx] = bytes[0];
-                self.data[idx + 1] = bytes[1];
-                self.data[idx + 2] = bytes[2];
-                self.data[idx + 3] = bytes[3];
-                self.data[idx + 4] = bytes[4];
-                self.data[idx + 5] = bytes[5];
-                self.data[idx + 6] = bytes[6];
-                self.data[idx + 7] = bytes[7];
-            }
-            _ => {
-                return Err(Trap::MemoryOutOfBounds {
-                    addr,
-                    size: size as u64,
-                })
-            }
-        }
-        Ok(())
+        self.write_fast(idx, size, value)
+            .map_err(|_| Trap::MemoryOutOfBounds {
+                addr,
+                size: size as u64,
+            })
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
@@ -193,7 +183,7 @@ const UART_POLL_TICKS_DEFAULT: u32 = 1024;
 const UART_POLL_CHECK_TICKS_DEFAULT: u32 = 2048;
 const UART_POLL_WALL_MS_DEFAULT: u64 = 100;
 const UART_POLL_CALIB_MS_DEFAULT: u64 = 250;
-const UART_FLUSH_EVERY_DEFAULT: usize = 64;
+const UART_FLUSH_EVERY_DEFAULT: usize = 256;
 
 impl Uart16550 {
     fn env_bool(name: &str, default: bool) -> bool {
@@ -277,7 +267,8 @@ impl Uart16550 {
             "UART_POLL_CALIB_MS",
             UART_POLL_CALIB_MS_DEFAULT,
         ));
-        let poll_check_ticks = Self::env_u32("UART_POLL_CHECK_TICKS", UART_POLL_CHECK_TICKS_DEFAULT);
+        let poll_check_ticks =
+            Self::env_u32("UART_POLL_CHECK_TICKS", UART_POLL_CHECK_TICKS_DEFAULT);
         let flush_every = Self::env_usize("UART_FLUSH_EVERY", UART_FLUSH_EVERY_DEFAULT);
         Self {
             ier: 0,
@@ -765,6 +756,29 @@ impl Device for Uart16550 {
         } else {
             self.poll_countdown -= 1;
         }
+    }
+
+    fn tick_n(&mut self, n: u32) {
+        if n == 0 {
+            return;
+        }
+        self.poll_calib_steps = self.poll_calib_steps.saturating_add(n as u64);
+
+        let mut rem = n;
+        while rem >= self.poll_check_countdown {
+            rem -= self.poll_check_countdown;
+            self.poll_check_countdown = self.poll_check_ticks;
+            self.maybe_recalibrate_poll_ticks();
+        }
+        self.poll_check_countdown -= rem;
+
+        let mut rem_poll = n;
+        while rem_poll >= self.poll_countdown {
+            rem_poll -= self.poll_countdown;
+            self.poll_countdown = self.poll_ticks;
+            self.poll_input();
+        }
+        self.poll_countdown -= rem_poll;
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
