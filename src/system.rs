@@ -486,7 +486,9 @@ impl System {
                     while executed < batch {
                         if native_jit_enabled {
                             let remaining = batch - executed;
-                            if let Some(done) = hart.try_run_native_jit(&mut self.bus, remaining)? {
+                            if let Some(done) =
+                                hart.try_run_native_jit(&mut self.bus, &mut self.sbi, remaining)?
+                            {
                                 executed += done;
                                 if self.sbi.shutdown_requested() {
                                     break;

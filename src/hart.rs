@@ -45,8 +45,8 @@ struct Decoded32 {
     csr_addr: u16,
 }
 
-const TLB_CACHE_SIZE: usize = 2_048;
-const DECODE_CACHE_SIZE: usize = 8_192;
+const TLB_CACHE_SIZE: usize = 8_192;
+const DECODE_CACHE_SIZE: usize = 65_536;
 const TLB_PERM_R: u8 = 1 << 0;
 const TLB_PERM_W: u8 = 1 << 1;
 const TLB_PERM_X: u8 = 1 << 2;
@@ -72,38 +72,14 @@ enum EmitFlow {
 }
 
 #[cfg(target_arch = "aarch64")]
-type NativeBlockFn =
-    unsafe extern "C" fn(*mut u64, *mut Hart, *mut (), *mut ()) -> NativeBlockResult;
-
-#[cfg(target_arch = "aarch64")]
-struct NativeJitHelperSbi;
-
-#[cfg(target_arch = "aarch64")]
-impl Sbi for NativeJitHelperSbi {
-    fn handle_ecall(
-        &mut self,
-        _hart: &mut Hart,
-        _bus: &mut dyn crate::bus::Bus,
-    ) -> Result<bool, Trap> {
-        Ok(false)
-    }
-
-    fn tick(&mut self, _cycles: u64) {}
-
-    fn time(&self) -> u64 {
-        0
-    }
-
-    fn timer_due(&self, _hart_id: usize) -> bool {
-        false
-    }
-
-    fn shutdown_requested(&self) -> bool {
-        false
-    }
-
-    fn dump_stats(&self) {}
-}
+type NativeBlockFn = unsafe extern "C" fn(
+    *mut u64,
+    *mut Hart,
+    *mut (),
+    *mut (),
+    *mut (),
+    *mut (),
+) -> NativeBlockResult;
 
 #[cfg(target_arch = "aarch64")]
 struct NativeCodeCache {
@@ -540,7 +516,7 @@ pub struct Hart {
     time_jitter_enabled: bool,
     time_jitter_state: u64,
     satp_cached: u64,
-    tlb: [Option<TlbEntry>; TLB_CACHE_SIZE],
+    tlb: Box<[Option<TlbEntry>]>,
     fast_tlb_fetch: Option<FastTlbEntry>,
     fast_tlb_load: Option<FastTlbEntry>,
     fast_tlb_store: Option<FastTlbEntry>,
@@ -549,7 +525,7 @@ pub struct Hart {
     native_jit_probe_printed: bool,
     native_jit_hot_threshold: u16,
     native_jit: NativeJit,
-    decode_cache: [Option<DecodeCacheEntry>; DECODE_CACHE_SIZE],
+    decode_cache: Box<[Option<DecodeCacheEntry>]>,
 }
 
 #[derive(Clone, Debug)]
@@ -662,7 +638,7 @@ impl Hart {
             .unwrap_or(32 * 1024 * 1024);
         let native_jit_hot_threshold = parse_env_u64("KOR_JIT_NATIVE_HOT_THRESHOLD")
             .and_then(|v| u16::try_from(v).ok())
-            .unwrap_or(2)
+            .unwrap_or(8)
             .max(1);
         let mut time_jitter_state = 0x9E37_79B9_7F4A_7C15u64 ^ ((hart_id as u64) << 32);
         if time_jitter_state == 0 {
@@ -720,7 +696,7 @@ impl Hart {
             time_jitter_enabled,
             time_jitter_state,
             satp_cached: 0,
-            tlb: [None; TLB_CACHE_SIZE],
+            tlb: vec![None; TLB_CACHE_SIZE].into_boxed_slice(),
             fast_tlb_fetch: None,
             fast_tlb_load: None,
             fast_tlb_store: None,
@@ -729,7 +705,7 @@ impl Hart {
             native_jit_probe_printed: false,
             native_jit_hot_threshold,
             native_jit,
-            decode_cache: [None; DECODE_CACHE_SIZE],
+            decode_cache: vec![None; DECODE_CACHE_SIZE].into_boxed_slice(),
         }
     }
 
@@ -1210,6 +1186,7 @@ impl Hart {
         pc: u64,
         instr: u32,
         d: Decoded32,
+        prefix_count: u32,
     ) -> bool {
         match d.opcode as u32 {
             OPCODE_LOAD | OPCODE_STORE | OPCODE_LOAD_FP | OPCODE_STORE_FP | OPCODE_SYSTEM
@@ -1219,13 +1196,16 @@ impl Hart {
 
         // x0=regs_ptr, x1=hart_ptr, x2=bus_data, x3=bus_vtable.
         // Call helper as:
-        //   x0=hart_ptr, x1=bus_data, x2=bus_vtable, x3=instr, x4=pc
+        //   x0=hart_ptr, x1=bus_data, x2=bus_vtable, x3=sbi_data, x4=sbi_vtable,
+        //   x5=instr, x6=pc
         // Helper returns NativeBlockResult in x0/x1.
         em.emit(A64Emitter::mov_x(0, 1));
         em.emit(A64Emitter::mov_x(1, 2));
         em.emit(A64Emitter::mov_x(2, 3));
-        em.mov_imm64(3, instr as u64);
-        em.mov_imm64(4, pc);
+        em.emit(A64Emitter::mov_x(3, 4));
+        em.emit(A64Emitter::mov_x(4, 5));
+        em.mov_imm64(5, instr as u64);
+        em.mov_imm64(6, pc);
         em.mov_imm64(
             16,
             Self::native_exec32_term_helper as *const () as usize as u64,
@@ -1235,12 +1215,22 @@ impl Hart {
         em.emit(A64Emitter::blr(16));
         em.emit(A64Emitter::ldr_x(30, 31, 0));
         em.emit(A64Emitter::add_sp_imm(16));
+        if prefix_count != 0 {
+            em.mov_imm64(12, prefix_count as u64);
+            em.emit(A64Emitter::add_x(1, 1, 12));
+        }
         em.emit(0xD65F_03C0); // ret
         true
     }
 
     #[cfg(target_arch = "aarch64")]
-    fn emit_native_term_helper16(&self, em: &mut A64Emitter, pc: u64, instr: u16) -> bool {
+    fn emit_native_term_helper16(
+        &self,
+        em: &mut A64Emitter,
+        pc: u64,
+        instr: u16,
+        prefix_count: u32,
+    ) -> bool {
         let funct3 = (instr >> 13) & 0x7;
         let op = instr & 0x3;
         let supports = match op {
@@ -1254,13 +1244,16 @@ impl Hart {
 
         // x0=regs_ptr, x1=hart_ptr, x2=bus_data, x3=bus_vtable.
         // Call helper as:
-        //   x0=hart_ptr, x1=bus_data, x2=bus_vtable, x3=instr16, x4=pc
+        //   x0=hart_ptr, x1=bus_data, x2=bus_vtable, x3=sbi_data, x4=sbi_vtable,
+        //   x5=instr16, x6=pc
         // Helper returns NativeBlockResult in x0/x1.
         em.emit(A64Emitter::mov_x(0, 1));
         em.emit(A64Emitter::mov_x(1, 2));
         em.emit(A64Emitter::mov_x(2, 3));
-        em.mov_imm64(3, instr as u64);
-        em.mov_imm64(4, pc);
+        em.emit(A64Emitter::mov_x(3, 4));
+        em.emit(A64Emitter::mov_x(4, 5));
+        em.mov_imm64(5, instr as u64);
+        em.mov_imm64(6, pc);
         em.mov_imm64(
             16,
             Self::native_exec16_term_helper as *const () as usize as u64,
@@ -1270,6 +1263,10 @@ impl Hart {
         em.emit(A64Emitter::blr(16));
         em.emit(A64Emitter::ldr_x(30, 31, 0));
         em.emit(A64Emitter::add_sp_imm(16));
+        if prefix_count != 0 {
+            em.mov_imm64(12, prefix_count as u64);
+            em.emit(A64Emitter::add_x(1, 1, 12));
+        }
         em.emit(0xD65F_03C0); // ret
         true
     }
@@ -1279,10 +1276,17 @@ impl Hart {
         hart_ptr: *mut Hart,
         bus_data: *mut (),
         bus_vtable: *mut (),
+        sbi_data: *mut (),
+        sbi_vtable: *mut (),
         instr: u64,
         pc: u64,
     ) -> NativeBlockResult {
-        if hart_ptr.is_null() || bus_data.is_null() || bus_vtable.is_null() {
+        if hart_ptr.is_null()
+            || bus_data.is_null()
+            || bus_vtable.is_null()
+            || sbi_data.is_null()
+            || sbi_vtable.is_null()
+        {
             return NativeBlockResult {
                 next_pc: pc,
                 executed: 0,
@@ -1294,16 +1298,21 @@ impl Hart {
             std::mem::transmute::<(*mut (), *mut ()), *mut dyn Bus>((bus_data, bus_vtable))
         };
         let bus = unsafe { &mut *bus_ptr };
+        let sbi_ptr: *mut dyn Sbi = unsafe {
+            std::mem::transmute::<(*mut (), *mut ()), *mut dyn Sbi>((sbi_data, sbi_vtable))
+        };
+        let sbi = unsafe { &mut *sbi_ptr };
 
+        hart.pc = pc;
         let instr = instr as u32;
         let d = Self::decode32(instr);
-        let mut sbi = NativeJitHelperSbi;
-        let next_pc = match hart.exec32_decoded(bus, &mut sbi, instr, d) {
+        let next_pc = match hart.exec32_decoded(bus, sbi, instr, d) {
             Ok(v) => v,
-            Err(_) => {
+            Err(trap) => {
+                hart.handle_trap(trap);
                 return NativeBlockResult {
-                    next_pc: pc,
-                    executed: 0,
+                    next_pc: hart.pc,
+                    executed: 1,
                 };
             }
         };
@@ -1318,6 +1327,8 @@ impl Hart {
         hart_ptr: *mut Hart,
         bus_data: *mut (),
         bus_vtable: *mut (),
+        _sbi_data: *mut (),
+        _sbi_vtable: *mut (),
         instr: u64,
         pc: u64,
     ) -> NativeBlockResult {
@@ -1453,15 +1464,18 @@ impl Hart {
             }
         })();
 
-        if res.is_err() {
-            NativeBlockResult {
-                next_pc: pc,
-                executed: 0,
-            }
-        } else {
-            NativeBlockResult {
+        match res {
+            Ok(()) => NativeBlockResult {
                 next_pc,
                 executed: 1,
+            },
+            Err(trap) => {
+                hart.pc = pc;
+                hart.handle_trap(trap);
+                NativeBlockResult {
+                    next_pc: hart.pc,
+                    executed: 1,
+                }
             }
         }
     }
@@ -1903,10 +1917,10 @@ impl Hart {
 
             if (instr16 & 0x3) != 0x3 {
                 let Some(flow) = self.emit_native_instr16(&mut em, pc, instr16) else {
-                    if emitted == 0 && self.emit_native_term_helper16(&mut em, pc, instr16) {
+                    if self.emit_native_term_helper16(&mut em, pc, instr16, emitted) {
                         helper_terminator = true;
                         terminated = true;
-                        emitted = 1;
+                        emitted += 1;
                         if self.native_jit_trace {
                             instr_log.push((pc, instr16 as u32, 2));
                         }
@@ -1947,10 +1961,10 @@ impl Hart {
             let instr = (upper << 16) | instr16 as u32;
             let d = Self::decode32(instr);
             let Some(flow) = self.emit_native_instr(&mut em, pc, instr, d) else {
-                if emitted == 0 && self.emit_native_term_helper32(&mut em, pc, instr, d) {
+                if self.emit_native_term_helper32(&mut em, pc, instr, d, emitted) {
                     helper_terminator = true;
                     terminated = true;
-                    emitted = 1;
+                    emitted += 1;
                     if self.native_jit_trace {
                         instr_log.push((pc, instr, 4));
                     }
@@ -2051,11 +2065,12 @@ impl Hart {
     pub fn try_run_native_jit(
         &mut self,
         bus: &mut impl Bus,
+        sbi: &mut impl Sbi,
         max_steps: u32,
     ) -> Result<Option<u32>, Trap> {
         #[cfg(not(target_arch = "aarch64"))]
         {
-            let _ = (bus, max_steps);
+            let _ = (bus, sbi, max_steps);
             return Ok(None);
         }
         #[cfg(target_arch = "aarch64")]
@@ -2084,67 +2099,81 @@ impl Hart {
             if self.irq_check_countdown <= 1 {
                 return Ok(None);
             }
-            let budget = max_steps.min(self.irq_check_countdown.saturating_sub(1));
-            if budget < 1 {
+            let mut remaining = max_steps.min(self.irq_check_countdown.saturating_sub(1));
+            if remaining < 1 {
                 return Ok(None);
             }
-
-            let satp = self.satp_cached;
-            let start_pc = self.pc;
-            let mut block = self.native_jit.lookup(satp, start_pc);
-            if block.is_none() {
-                if self.native_jit.is_failed(satp, start_pc) {
-                    return Ok(None);
-                }
-                if self.native_jit_hot_threshold > 1 {
-                    let seen = self.native_jit.bump_hot(satp, start_pc);
-                    if seen < self.native_jit_hot_threshold {
-                        return Ok(None);
+            let mut done_total = 0u32;
+            while remaining > 0 {
+                let satp = self.satp_cached;
+                let start_pc = self.pc;
+                let mut block = self.native_jit.lookup(satp, start_pc);
+                if block.is_none() {
+                    if self.native_jit.is_failed(satp, start_pc) {
+                        break;
                     }
-                }
-                block = match self.compile_native_block(bus, budget) {
-                    Ok(v) => v,
-                    Err(_) => {
-                        self.native_jit.mark_failed(satp, start_pc);
-                        None
+                    if self.native_jit_hot_threshold > 1 {
+                        let seen = self.native_jit.bump_hot(satp, start_pc);
+                        if seen < self.native_jit_hot_threshold {
+                            break;
+                        }
                     }
+                    block = match self.compile_native_block(bus, remaining) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            self.native_jit.mark_failed(satp, start_pc);
+                            None
+                        }
+                    };
+                }
+                let Some(block) = block else {
+                    break;
                 };
-            }
-            let Some(block) = block else {
-                return Ok(None);
-            };
-            if block.instrs < 1 || block.instrs > budget {
-                return Ok(None);
-            }
+                if block.instrs < 1 || block.instrs > remaining {
+                    break;
+                }
 
-            let Some(cache) = self.native_jit.cache.as_ref() else {
-                self.native_jit.enabled = false;
-                return Ok(None);
-            };
-            cache.prepare_execute();
-            let fn_ptr = cache.ptr_at(block.offset);
-            let func: NativeBlockFn = unsafe { std::mem::transmute(fn_ptr) };
-            let bus_dyn: &mut dyn Bus = bus;
-            let (bus_data, bus_vtable): (*mut (), *mut ()) =
-                unsafe { std::mem::transmute::<*mut dyn Bus, (*mut (), *mut ())>(bus_dyn) };
-            let res = unsafe {
-                func(
-                    self.regs.as_mut_ptr(),
-                    self as *mut Hart,
-                    bus_data,
-                    bus_vtable,
-                )
-            };
-            if res.executed != block.instrs as u64 || res.executed == 0 {
+                let Some(cache) = self.native_jit.cache.as_ref() else {
+                    self.native_jit.enabled = false;
+                    break;
+                };
+                cache.prepare_execute();
+                let fn_ptr = cache.ptr_at(block.offset);
+                let func: NativeBlockFn = unsafe { std::mem::transmute(fn_ptr) };
+                let bus_dyn: &mut dyn Bus = bus;
+                let bus_ptr: *mut dyn Bus = bus_dyn as *mut dyn Bus;
+                let (bus_data, bus_vtable): (*mut (), *mut ()) =
+                    unsafe { std::mem::transmute::<*mut dyn Bus, (*mut (), *mut ())>(bus_ptr) };
+                let sbi_dyn: &mut dyn Sbi = sbi;
+                let sbi_ptr: *mut dyn Sbi = sbi_dyn as *mut dyn Sbi;
+                let (sbi_data, sbi_vtable): (*mut (), *mut ()) =
+                    unsafe { std::mem::transmute::<*mut dyn Sbi, (*mut (), *mut ())>(sbi_ptr) };
+                let res = unsafe {
+                    func(
+                        self.regs.as_mut_ptr(),
+                        self as *mut Hart,
+                        bus_data,
+                        bus_vtable,
+                        sbi_data,
+                        sbi_vtable,
+                    )
+                };
+                if res.executed != block.instrs as u64 || res.executed == 0 {
+                    break;
+                }
+
+                let done = res.executed as u32;
+                self.pc = res.next_pc;
+                self.regs[0] = 0;
+                done_total = done_total.saturating_add(done);
+                remaining = remaining.saturating_sub(done);
+            }
+            if done_total == 0 {
                 return Ok(None);
             }
+            self.instret_pending = self.instret_pending.wrapping_add(done_total as u64);
 
-            let done = res.executed as u32;
-            self.pc = res.next_pc;
-            self.regs[0] = 0;
-            self.instret_pending = self.instret_pending.wrapping_add(done as u64);
-
-            let total = self.time_div_accum.saturating_add(done);
+            let total = self.time_div_accum.saturating_add(done_total);
             if total >= self.time_divider {
                 let ticks = total / self.time_divider;
                 self.time_div_accum = total % self.time_divider;
@@ -2152,8 +2181,8 @@ impl Hart {
             } else {
                 self.time_div_accum = total;
             }
-            self.irq_check_countdown = self.irq_check_countdown.saturating_sub(done);
-            Ok(Some(done))
+            self.irq_check_countdown = self.irq_check_countdown.saturating_sub(done_total);
+            Ok(Some(done_total))
         }
     }
 
@@ -2847,7 +2876,7 @@ impl Hart {
     fn exec32_decoded(
         &mut self,
         bus: &mut dyn Bus,
-        sbi: &mut impl Sbi,
+        sbi: &mut (impl Sbi + ?Sized),
         instr: u32,
         d: Decoded32,
     ) -> Result<u64, Trap> {
