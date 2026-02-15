@@ -550,6 +550,18 @@ pub struct HartSnapshot {
 }
 
 impl Hart {
+    const MEM_OP_LB: u64 = 0;
+    const MEM_OP_LH: u64 = 1;
+    const MEM_OP_LW: u64 = 2;
+    const MEM_OP_LD: u64 = 3;
+    const MEM_OP_LBU: u64 = 4;
+    const MEM_OP_LHU: u64 = 5;
+    const MEM_OP_LWU: u64 = 6;
+    const MEM_OP_SB: u64 = 16;
+    const MEM_OP_SH: u64 = 17;
+    const MEM_OP_SW: u64 = 18;
+    const MEM_OP_SD: u64 = 19;
+
     pub fn new(hart_id: usize, misa_ext: u64) -> Self {
         fn parse_env_u64(name: &str) -> Option<u64> {
             std::env::var(name).ok().and_then(|v| {
@@ -1179,7 +1191,6 @@ impl Hart {
         }
     }
 
-    #[cfg(target_arch = "aarch64")]
     fn emit_native_term_helper32(
         &self,
         em: &mut A64Emitter,
@@ -1188,7 +1199,78 @@ impl Hart {
         d: Decoded32,
         prefix_count: u32,
     ) -> bool {
-        match d.opcode as u32 {
+        let opcode = d.opcode as u32;
+        if opcode == OPCODE_LOAD || opcode == OPCODE_STORE {
+            let funct3 = d.funct3 as u32;
+            let rs1 = d.rs1 as usize;
+            let rs2 = d.rs2 as usize;
+            let rd = d.rd as usize;
+            let (mem_op, imm, is_store) = if opcode == OPCODE_LOAD {
+                let op = match funct3 {
+                    F3_LB => Self::MEM_OP_LB,
+                    F3_LH => Self::MEM_OP_LH,
+                    F3_LW => Self::MEM_OP_LW,
+                    F3_LD => Self::MEM_OP_LD,
+                    F3_LBU => Self::MEM_OP_LBU,
+                    F3_LHU => Self::MEM_OP_LHU,
+                    F3_LWU => Self::MEM_OP_LWU,
+                    _ => return false,
+                };
+                (op, Self::imm_i(instr), false)
+            } else {
+                let op = match funct3 {
+                    F3_SB => Self::MEM_OP_SB,
+                    F3_SH => Self::MEM_OP_SH,
+                    F3_SW => Self::MEM_OP_SW,
+                    F3_SD => Self::MEM_OP_SD,
+                    _ => return false,
+                };
+                (op, Self::imm_s(instr), true)
+            };
+
+            // Compute effective address in native code.
+            em.emit(A64Emitter::ldr_x(9, 0, Self::reg_off(rs1)));
+            em.mov_imm64(10, imm as u64);
+            em.emit(A64Emitter::add_x(11, 9, 10));
+            if is_store {
+                em.emit(A64Emitter::ldr_x(12, 0, Self::reg_off(rs2)));
+            }
+
+            // x0=regs_ptr, x1=hart_ptr, x2=bus_data, x3=bus_vtable.
+            // Helper args:
+            //   x0=hart_ptr, x1=bus_data, x2=bus_vtable, x3=mem_op, x4=rd, x5=store_val,
+            //   x6=addr, x7=next_pc, x8=trap_pc
+            em.emit(A64Emitter::mov_x(0, 1));
+            em.emit(A64Emitter::mov_x(1, 2));
+            em.emit(A64Emitter::mov_x(2, 3));
+            em.mov_imm64(3, mem_op);
+            em.mov_imm64(4, rd as u64);
+            if is_store {
+                em.emit(A64Emitter::mov_x(5, 12));
+            } else {
+                em.mov_imm64(5, 0);
+            }
+            em.emit(A64Emitter::mov_x(6, 11));
+            em.mov_imm64(7, pc.wrapping_add(4));
+            em.mov_imm64(8, pc);
+            em.mov_imm64(
+                16,
+                Self::native_exec_mem_term_helper as *const () as usize as u64,
+            );
+            em.emit(A64Emitter::sub_sp_imm(16));
+            em.emit(A64Emitter::str_x(30, 31, 0));
+            em.emit(A64Emitter::blr(16));
+            em.emit(A64Emitter::ldr_x(30, 31, 0));
+            em.emit(A64Emitter::add_sp_imm(16));
+            if prefix_count != 0 {
+                em.mov_imm64(12, prefix_count as u64);
+                em.emit(A64Emitter::add_x(1, 1, 12));
+            }
+            em.emit(0xD65F_03C0); // ret
+            return true;
+        }
+
+        match opcode {
             OPCODE_LOAD | OPCODE_STORE | OPCODE_LOAD_FP | OPCODE_STORE_FP | OPCODE_SYSTEM
             | OPCODE_AMO => {}
             _ => return false,
@@ -1269,6 +1351,91 @@ impl Hart {
         }
         em.emit(0xD65F_03C0); // ret
         true
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe extern "C" fn native_exec_mem_term_helper(
+        hart_ptr: *mut Hart,
+        bus_data: *mut (),
+        bus_vtable: *mut (),
+        mem_op: u64,
+        rd: u64,
+        store_val: u64,
+        addr: u64,
+        next_pc: u64,
+        trap_pc: u64,
+    ) -> NativeBlockResult {
+        if hart_ptr.is_null() || bus_data.is_null() || bus_vtable.is_null() {
+            return NativeBlockResult {
+                next_pc: trap_pc,
+                executed: 0,
+            };
+        }
+
+        let hart = unsafe { &mut *hart_ptr };
+        let bus_ptr: *mut dyn Bus = unsafe {
+            std::mem::transmute::<(*mut (), *mut ()), *mut dyn Bus>((bus_data, bus_vtable))
+        };
+        let bus = unsafe { &mut *bus_ptr };
+        let rd = (rd as usize) & 31;
+
+        let mut is_load = true;
+        let mem_res: Result<u64, Trap> = match mem_op {
+            Self::MEM_OP_LB => hart
+                .read_u8(bus, addr, AccessType::Load)
+                .map(|v| (v as i8 as i64) as u64),
+            Self::MEM_OP_LH => hart
+                .read_u16(bus, addr, AccessType::Load)
+                .map(|v| (v as i16 as i64) as u64),
+            Self::MEM_OP_LW => hart
+                .read_u32(bus, addr, AccessType::Load)
+                .map(|v| (v as i32 as i64) as u64),
+            Self::MEM_OP_LD => hart.read_u64(bus, addr, AccessType::Load),
+            Self::MEM_OP_LBU => hart.read_u8(bus, addr, AccessType::Load).map(|v| v as u64),
+            Self::MEM_OP_LHU => hart.read_u16(bus, addr, AccessType::Load).map(|v| v as u64),
+            Self::MEM_OP_LWU => hart.read_u32(bus, addr, AccessType::Load).map(|v| v as u64),
+            Self::MEM_OP_SB => {
+                is_load = false;
+                hart.write_u8(bus, addr, store_val as u8, AccessType::Store)
+                    .map(|_| 0)
+            }
+            Self::MEM_OP_SH => {
+                is_load = false;
+                hart.write_u16(bus, addr, store_val as u16, AccessType::Store)
+                    .map(|_| 0)
+            }
+            Self::MEM_OP_SW => {
+                is_load = false;
+                hart.write_u32(bus, addr, store_val as u32, AccessType::Store)
+                    .map(|_| 0)
+            }
+            Self::MEM_OP_SD => {
+                is_load = false;
+                hart.write_u64(bus, addr, store_val, AccessType::Store)
+                    .map(|_| 0)
+            }
+            _ => Err(Trap::IllegalInstruction(0)),
+        };
+
+        match mem_res {
+            Ok(v) => {
+                if is_load && rd != 0 {
+                    hart.regs[rd] = v;
+                }
+                NativeBlockResult {
+                    next_pc,
+                    executed: 1,
+                }
+            }
+            Err(trap) => {
+                hart.pc = trap_pc;
+                hart.handle_trap(trap);
+                NativeBlockResult {
+                    next_pc: hart.pc,
+                    executed: 1,
+                }
+            }
+        }
     }
 
     #[cfg(target_arch = "aarch64")]

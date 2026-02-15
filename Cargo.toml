@@ -27,6 +27,10 @@ path = "src/bin/korisc.rs"
 name = "kor"
 path = "src/bin/kor.rs"
 
+[[bin]]
+name = "korjitdiff"
+path = "src/bin/korjitdiff.rs"
+
 [profile.release]
 codegen-units = 1
 lto = "fat"
