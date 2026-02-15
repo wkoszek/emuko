@@ -4,7 +4,7 @@ use crate::trap::Trap;
 use std::any::Any;
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
@@ -157,6 +157,7 @@ pub struct Uart16550 {
     poll_check_countdown: u32,
     flush_every: usize,
     flush_count: usize,
+    host_out_buf: Vec<u8>,
 }
 
 #[derive(Clone, Debug)]
@@ -183,7 +184,7 @@ const UART_POLL_TICKS_DEFAULT: u32 = 1024;
 const UART_POLL_CHECK_TICKS_DEFAULT: u32 = 2048;
 const UART_POLL_WALL_MS_DEFAULT: u64 = 100;
 const UART_POLL_CALIB_MS_DEFAULT: u64 = 250;
-const UART_FLUSH_EVERY_DEFAULT: usize = 256;
+const UART_FLUSH_EVERY_DEFAULT: usize = 1024;
 
 impl Uart16550 {
     fn env_bool(name: &str, default: bool) -> bool {
@@ -270,6 +271,7 @@ impl Uart16550 {
         let poll_check_ticks =
             Self::env_u32("UART_POLL_CHECK_TICKS", UART_POLL_CHECK_TICKS_DEFAULT);
         let flush_every = Self::env_usize("UART_FLUSH_EVERY", UART_FLUSH_EVERY_DEFAULT);
+        let color_enabled = Self::env_bool("UART_COLOR", io::stdout().is_terminal());
         Self {
             ier: 0,
             lcr: 0,
@@ -287,7 +289,7 @@ impl Uart16550 {
                 None
             },
             irq: Some((plic, irq)),
-            color_enabled: true,
+            color_enabled,
             color_active: false,
             trace_input: std::env::var("UART_TRACE_INPUT").is_ok(),
             irq_line: false,
@@ -306,6 +308,7 @@ impl Uart16550 {
             poll_check_countdown: poll_check_ticks,
             flush_every,
             flush_count: 0,
+            host_out_buf: Vec::with_capacity(flush_every.max(64)),
         }
     }
 
@@ -357,6 +360,21 @@ impl Uart16550 {
 
     pub fn configure_flush_every(&mut self, every: usize) {
         self.flush_every = every.max(1);
+        if self.host_out_buf.capacity() < self.flush_every {
+            self.host_out_buf
+                .reserve(self.flush_every - self.host_out_buf.capacity());
+        }
+    }
+
+    fn flush_host_output(&mut self) {
+        if self.host_out_buf.is_empty() {
+            return;
+        }
+        let stdout = io::stdout();
+        let mut out = stdout.lock();
+        let _ = out.write_all(&self.host_out_buf);
+        let _ = out.flush();
+        self.host_out_buf.clear();
     }
 
     fn emit_raw_char(&mut self, ch: u8) {
@@ -365,19 +383,19 @@ impl Uart16550 {
         }
         self.tx_capture.push_back(ch);
         if self.color_enabled && !self.color_active {
-            print!("\x1b[38;5;208m");
+            self.host_out_buf.extend_from_slice(b"\x1b[38;5;208m");
             self.color_active = true;
         }
-        print!("{}", ch as char);
+        self.host_out_buf.push(ch);
         if self.color_enabled && self.color_active && (ch == b'\n' || ch == b'\r') {
             // Keep non-UART logs uncolored by resetting terminal color at line end.
-            print!("\x1b[0m");
+            self.host_out_buf.extend_from_slice(b"\x1b[0m");
             self.color_active = false;
         }
         self.flush_count = self.flush_count.saturating_add(1);
         let should_flush = ch == b'\n' || ch == b'\r' || self.flush_count >= self.flush_every;
         if should_flush {
-            let _ = io::stdout().flush();
+            self.flush_host_output();
             self.flush_count = 0;
         }
     }
@@ -621,6 +639,7 @@ impl Uart16550 {
         self.poll_calib_started = Instant::now();
         self.poll_check_countdown = self.poll_check_ticks;
         self.flush_count = 0;
+        self.host_out_buf.clear();
         self.update_irq_line();
     }
 }

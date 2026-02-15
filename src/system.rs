@@ -248,9 +248,9 @@ impl System {
                 .unwrap_or(1.0),
         );
         let device_tick_stride = Self::env_u32("KOR_DEVICE_TICK_STRIDE", 256).max(1);
-        let irq_poll_stride = Self::env_u32("KOR_IRQ_POLL_STRIDE", 256).max(1);
+        let irq_poll_stride = Self::env_u32("KOR_IRQ_POLL_STRIDE", 1024).max(1);
         let time_divider = Self::env_u32("KOR_TIME_DIVIDER", 4).max(1);
-        let run_batch_steps = Self::env_u32("KOR_RUN_BATCH_STEPS", 16_384).max(1);
+        let run_batch_steps = Self::env_u32("KOR_RUN_BATCH_STEPS", 65_536).max(1);
 
         Self {
             bus,
