@@ -94,8 +94,7 @@ fn parse_opts() -> DaemonOpts {
     let mut initrd = None;
     let mut ram_size = 1024 * 1024 * 1024u64;
     let mut bootargs =
-        "console=ttyS0,115200 earlycon=uart8250,mmio,0x10000000 rdinit=/bin/sh"
-            .to_string();
+        "console=ttyS0,115200 earlycon=uart8250,mmio,0x10000000 rdinit=/bin/sh".to_string();
     let mut addr = "127.0.0.1:7788".to_string();
     let mut snapshot_dir = "/tmp/korisc5".to_string();
     let mut chunk_steps = 4_000_000u64;

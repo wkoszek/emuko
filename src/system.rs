@@ -429,7 +429,10 @@ impl System {
     fn trace_and_handle_trap(trace_traps: &mut Option<u64>, hart: &mut Hart, trap: Trap) {
         if let Some(left) = trace_traps.as_mut() {
             if *left > 0 {
-                eprintln!("trap hart={} pc=0x{:016x} {:?}", hart.hart_id, hart.pc, trap);
+                eprintln!(
+                    "trap hart={} pc=0x{:016x} {:?}",
+                    hart.hart_id, hart.pc, trap
+                );
                 if let Some((kind, addr, size)) = hart.last_access() {
                     eprintln!(
                         "  last_access kind={:?} addr=0x{:016x} size={}",

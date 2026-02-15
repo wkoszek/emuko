@@ -8,7 +8,7 @@ use crate::disas;
 use crate::isa::*;
 use crate::sbi::Sbi;
 use crate::trap::Trap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy)]
 struct TlbEntry {
@@ -65,14 +65,53 @@ struct NativeBlock {
     instrs: u32,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EmitFlow {
+    Continue,
+    Terminate,
+}
+
 #[cfg(target_arch = "aarch64")]
-type NativeBlockFn = unsafe extern "C" fn(*mut u64) -> NativeBlockResult;
+type NativeBlockFn =
+    unsafe extern "C" fn(*mut u64, *mut Hart, *mut (), *mut ()) -> NativeBlockResult;
+
+#[cfg(target_arch = "aarch64")]
+struct NativeJitHelperSbi;
+
+#[cfg(target_arch = "aarch64")]
+impl Sbi for NativeJitHelperSbi {
+    fn handle_ecall(
+        &mut self,
+        _hart: &mut Hart,
+        _bus: &mut dyn crate::bus::Bus,
+    ) -> Result<bool, Trap> {
+        Ok(false)
+    }
+
+    fn tick(&mut self, _cycles: u64) {}
+
+    fn time(&self) -> u64 {
+        0
+    }
+
+    fn timer_due(&self, _hart_id: usize) -> bool {
+        false
+    }
+
+    fn shutdown_requested(&self) -> bool {
+        false
+    }
+
+    fn dump_stats(&self) {}
+}
 
 #[cfg(target_arch = "aarch64")]
 struct NativeCodeCache {
     ptr: *mut u8,
     size: usize,
     used: usize,
+    #[cfg(target_os = "macos")]
+    use_map_jit: bool,
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -112,6 +151,8 @@ impl NativeCodeCache {
         #[cfg(not(target_os = "macos"))]
         let flags = MAP_PRIVATE | MAP_ANON;
 
+        #[cfg(target_os = "macos")]
+        let mut use_map_jit = true;
         let mut p = unsafe {
             mmap(
                 std::ptr::null_mut(),
@@ -125,6 +166,7 @@ impl NativeCodeCache {
         #[cfg(target_os = "macos")]
         if p as isize == -1 {
             // Some environments deny MAP_JIT; try a best-effort fallback.
+            use_map_jit = false;
             p = unsafe {
                 mmap(
                     std::ptr::null_mut(),
@@ -143,6 +185,8 @@ impl NativeCodeCache {
             ptr: p as *mut u8,
             size,
             used: 0,
+            #[cfg(target_os = "macos")]
+            use_map_jit,
         })
     }
 
@@ -156,9 +200,13 @@ impl NativeCodeCache {
         if end > self.size {
             return None;
         }
+        #[cfg(target_os = "macos")]
+        self.set_writable(true);
         unsafe {
             std::ptr::copy_nonoverlapping(code.as_ptr(), self.ptr.add(aligned), code.len());
         }
+        #[cfg(target_os = "macos")]
+        self.set_writable(false);
         self.flush_icache(aligned, code.len());
         self.used = end;
         Some(aligned)
@@ -166,6 +214,23 @@ impl NativeCodeCache {
 
     fn ptr_at(&self, off: usize) -> *const u8 {
         unsafe { self.ptr.add(off) as *const u8 }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn set_writable(&self, writable: bool) {
+        if !self.use_map_jit {
+            return;
+        }
+        extern "C" {
+            fn pthread_jit_write_protect_np(enabled: i32);
+        }
+        // enabled=1 means write-protected/executable; enabled=0 means writable.
+        unsafe { pthread_jit_write_protect_np(if writable { 0 } else { 1 }) };
+    }
+
+    fn prepare_execute(&self) {
+        #[cfg(target_os = "macos")]
+        self.set_writable(false);
     }
 
     fn flush_icache(&self, off: usize, len: usize) {
@@ -203,6 +268,8 @@ impl Drop for NativeCodeCache {
 struct NativeJit {
     enabled: bool,
     blocks: HashMap<(u64, u64), NativeBlock>,
+    failed: HashSet<(u64, u64)>,
+    hot: HashMap<(u64, u64), u16>,
     #[cfg(target_arch = "aarch64")]
     cache: Option<NativeCodeCache>,
 }
@@ -223,6 +290,8 @@ impl NativeJit {
             Self {
                 enabled: enabled && ready,
                 blocks: HashMap::new(),
+                failed: HashSet::new(),
+                hot: HashMap::new(),
                 cache,
             }
         }
@@ -232,12 +301,16 @@ impl NativeJit {
             Self {
                 enabled: false,
                 blocks: HashMap::new(),
+                failed: HashSet::new(),
+                hot: HashMap::new(),
             }
         }
     }
 
     fn clear(&mut self) {
         self.blocks.clear();
+        self.failed.clear();
+        self.hot.clear();
         #[cfg(target_arch = "aarch64")]
         if let Some(cache) = self.cache.as_mut() {
             cache.clear();
@@ -249,7 +322,24 @@ impl NativeJit {
     }
 
     fn insert(&mut self, satp: u64, pc: u64, block: NativeBlock) {
+        self.failed.remove(&(satp, pc));
+        self.hot.remove(&(satp, pc));
         self.blocks.insert((satp, pc), block);
+    }
+
+    fn is_failed(&self, satp: u64, pc: u64) -> bool {
+        self.failed.contains(&(satp, pc))
+    }
+
+    fn mark_failed(&mut self, satp: u64, pc: u64) {
+        self.hot.remove(&(satp, pc));
+        self.failed.insert((satp, pc));
+    }
+
+    fn bump_hot(&mut self, satp: u64, pc: u64) -> u16 {
+        let e = self.hot.entry((satp, pc)).or_insert(0);
+        *e = e.saturating_add(1);
+        *e
     }
 }
 
@@ -323,6 +413,72 @@ impl A64Emitter {
         0x9AC0_2800 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32
     }
 
+    #[inline]
+    fn mul_x(rd: u8, rn: u8, rm: u8) -> u32 {
+        0x9B00_7C00 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32
+    }
+
+    #[inline]
+    fn smulh_x(rd: u8, rn: u8, rm: u8) -> u32 {
+        0x9B40_7C00 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32
+    }
+
+    #[inline]
+    fn umulh_x(rd: u8, rn: u8, rm: u8) -> u32 {
+        0x9BC0_7C00 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32
+    }
+
+    #[inline]
+    fn udiv_x(rd: u8, rn: u8, rm: u8) -> u32 {
+        0x9AC0_0800 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32
+    }
+
+    #[inline]
+    fn sdiv_x(rd: u8, rn: u8, rm: u8) -> u32 {
+        0x9AC0_0C00 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32
+    }
+
+    #[inline]
+    fn mov_x(rd: u8, rn: u8) -> u32 {
+        Self::orr_x(rd, rn, 31)
+    }
+
+    #[inline]
+    fn sub_sp_imm(imm: u16) -> u32 {
+        let imm12 = (imm as u32) & 0xfff;
+        0xD100_03FF | (imm12 << 10)
+    }
+
+    #[inline]
+    fn add_sp_imm(imm: u16) -> u32 {
+        let imm12 = (imm as u32) & 0xfff;
+        0x9100_03FF | (imm12 << 10)
+    }
+
+    #[inline]
+    fn blr(rn: u8) -> u32 {
+        0xD63F_0000 | ((rn as u32) << 5)
+    }
+
+    #[inline]
+    fn cmp_x(rn: u8, rm: u8) -> u32 {
+        0xEB00_001F | ((rm as u32) << 16) | ((rn as u32) << 5)
+    }
+
+    #[inline]
+    fn csel_x(rd: u8, rn: u8, rm: u8, cond: u8) -> u32 {
+        0x9A80_0000
+            | ((rm as u32) << 16)
+            | (((cond as u32) & 0xf) << 12)
+            | ((rn as u32) << 5)
+            | rd as u32
+    }
+
+    #[inline]
+    fn sxtw_x(rd: u8, rn: u8) -> u32 {
+        0x9340_7C00 | ((rn as u32) << 5) | rd as u32
+    }
+
     fn mov_imm64(&mut self, rd: u8, val: u64) {
         let lo = (val & 0xffff) as u32;
         self.emit(0xD280_0000 | (lo << 5) | rd as u32);
@@ -391,6 +547,7 @@ pub struct Hart {
     decode_jit_enabled: bool,
     native_jit_trace: bool,
     native_jit_probe_printed: bool,
+    native_jit_hot_threshold: u16,
     native_jit: NativeJit,
     decode_cache: [Option<DecodeCacheEntry>; DECODE_CACHE_SIZE],
 }
@@ -503,6 +660,10 @@ impl Hart {
         let native_jit_code_size = parse_env_u64("KOR_JIT_NATIVE_CODE_SIZE")
             .and_then(|v| usize::try_from(v).ok())
             .unwrap_or(32 * 1024 * 1024);
+        let native_jit_hot_threshold = parse_env_u64("KOR_JIT_NATIVE_HOT_THRESHOLD")
+            .and_then(|v| u16::try_from(v).ok())
+            .unwrap_or(2)
+            .max(1);
         let mut time_jitter_state = 0x9E37_79B9_7F4A_7C15u64 ^ ((hart_id as u64) << 32);
         if time_jitter_state == 0 {
             time_jitter_state = 1;
@@ -566,6 +727,7 @@ impl Hart {
             decode_jit_enabled,
             native_jit_trace,
             native_jit_probe_printed: false,
+            native_jit_hot_threshold,
             native_jit,
             decode_cache: [None; DECODE_CACHE_SIZE],
         }
@@ -666,11 +828,7 @@ impl Hart {
 
     #[inline]
     fn tlb_index(satp: u64, vpage: u64) -> usize {
-        let mixed = vpage
-            ^ satp
-            ^ satp.rotate_right(17)
-            ^ vpage.rotate_left(13)
-            ^ (vpage >> 7);
+        let mixed = vpage ^ satp ^ satp.rotate_right(17) ^ vpage.rotate_left(13) ^ (vpage >> 7);
         (mixed as usize) & (TLB_CACHE_SIZE - 1)
     }
 
@@ -736,7 +894,11 @@ impl Hart {
             return;
         }
         let idx = Self::tlb_index(satp, vpage);
-        self.tlb[idx] = Some(TlbEntry { vpage, ppage, perms });
+        self.tlb[idx] = Some(TlbEntry {
+            vpage,
+            ppage,
+            perms,
+        });
     }
 
     #[inline]
@@ -767,7 +929,558 @@ impl Hart {
     }
 
     #[cfg(target_arch = "aarch64")]
-    fn emit_native_instr(&self, em: &mut A64Emitter, pc: u64, instr: u32, d: Decoded32) -> bool {
+    fn emit_native_instr16(&self, em: &mut A64Emitter, pc: u64, instr: u16) -> Option<EmitFlow> {
+        const C_EQ: u8 = 0x0;
+        const C_NE: u8 = 0x1;
+
+        let funct3 = (instr >> 13) & 0x7;
+        let op = instr & 0x3;
+        let rd = ((instr >> 7) & 0x1f) as usize;
+        let rs2 = ((instr >> 2) & 0x1f) as usize;
+        let rd_prime = (((instr >> 2) & 0x7) + 8) as usize;
+        let rs1_prime = (((instr >> 7) & 0x7) + 8) as usize;
+        let rs2_prime = (((instr >> 2) & 0x7) + 8) as usize;
+        let bit12 = (instr >> 12) & 0x1;
+
+        let imm_ci = || {
+            let imm = (((instr >> 12) & 0x1) << 5) | ((instr >> 2) & 0x1f);
+            Self::sign_extend(imm as u64, 6) as u64
+        };
+
+        let store_rd = |em: &mut A64Emitter, rd: usize| {
+            if rd != 0 {
+                em.emit(A64Emitter::str_x(11, 0, Self::reg_off(rd)));
+            }
+        };
+
+        match op {
+            0b00 => match funct3 {
+                0b000 => {
+                    // C.ADDI4SPN
+                    let imm = (((instr >> 12) & 0x1) << 5)
+                        | (((instr >> 11) & 0x1) << 4)
+                        | (((instr >> 10) & 0x1) << 9)
+                        | (((instr >> 9) & 0x1) << 8)
+                        | (((instr >> 8) & 0x1) << 7)
+                        | (((instr >> 7) & 0x1) << 6)
+                        | (((instr >> 6) & 0x1) << 2)
+                        | (((instr >> 5) & 0x1) << 3);
+                    if imm == 0 {
+                        return None;
+                    }
+                    em.emit(A64Emitter::ldr_x(9, 0, Self::reg_off(2)));
+                    em.mov_imm64(10, imm as u64);
+                    em.emit(A64Emitter::add_x(11, 9, 10));
+                    em.emit(A64Emitter::str_x(11, 0, Self::reg_off(rd_prime)));
+                    Some(EmitFlow::Continue)
+                }
+                _ => None,
+            },
+            0b01 => match funct3 {
+                0b000 => {
+                    // C.ADDI / C.NOP
+                    if rd != 0 {
+                        em.emit(A64Emitter::ldr_x(9, 0, Self::reg_off(rd)));
+                        em.mov_imm64(10, imm_ci());
+                        em.emit(A64Emitter::add_x(11, 9, 10));
+                        em.emit(A64Emitter::str_x(11, 0, Self::reg_off(rd)));
+                    }
+                    Some(EmitFlow::Continue)
+                }
+                0b001 => {
+                    // C.ADDIW
+                    if rd == 0 {
+                        return None;
+                    }
+                    em.emit(A64Emitter::ldr_x(9, 0, Self::reg_off(rd)));
+                    em.mov_imm64(10, imm_ci());
+                    em.emit(A64Emitter::add_x(11, 9, 10));
+                    em.emit(A64Emitter::sxtw_x(11, 11));
+                    em.emit(A64Emitter::str_x(11, 0, Self::reg_off(rd)));
+                    Some(EmitFlow::Continue)
+                }
+                0b010 => {
+                    // C.LI
+                    if rd != 0 {
+                        em.mov_imm64(11, imm_ci());
+                        em.emit(A64Emitter::str_x(11, 0, Self::reg_off(rd)));
+                    }
+                    Some(EmitFlow::Continue)
+                }
+                0b011 => {
+                    if rd == 2 {
+                        // C.ADDI16SP
+                        let imm = (((instr >> 12) & 0x1) << 9)
+                            | (((instr >> 6) & 0x1) << 4)
+                            | (((instr >> 5) & 0x1) << 6)
+                            | (((instr >> 4) & 0x1) << 8)
+                            | (((instr >> 3) & 0x1) << 7)
+                            | (((instr >> 2) & 0x1) << 5);
+                        let imm = Self::sign_extend(imm as u64, 10) as u64;
+                        if imm == 0 {
+                            return None;
+                        }
+                        em.emit(A64Emitter::ldr_x(9, 0, Self::reg_off(2)));
+                        em.mov_imm64(10, imm);
+                        em.emit(A64Emitter::add_x(11, 9, 10));
+                        em.emit(A64Emitter::str_x(11, 0, Self::reg_off(2)));
+                        Some(EmitFlow::Continue)
+                    } else {
+                        // C.LUI
+                        if rd == 0 {
+                            return None;
+                        }
+                        let imm = imm_ci();
+                        if imm == 0 {
+                            return None;
+                        }
+                        em.mov_imm64(11, ((imm as i64) << 12) as u64);
+                        em.emit(A64Emitter::str_x(11, 0, Self::reg_off(rd)));
+                        Some(EmitFlow::Continue)
+                    }
+                }
+                0b100 => {
+                    let funct2 = (instr >> 10) & 0x3;
+                    match funct2 {
+                        0b00 => {
+                            // C.SRLI
+                            let shamt = (((instr >> 12) & 0x1) << 5) | ((instr >> 2) & 0x1f);
+                            em.emit(A64Emitter::ldr_x(9, 0, Self::reg_off(rs1_prime)));
+                            em.mov_imm64(10, shamt as u64);
+                            em.emit(A64Emitter::lsrv_x(11, 9, 10));
+                            em.emit(A64Emitter::str_x(11, 0, Self::reg_off(rs1_prime)));
+                            Some(EmitFlow::Continue)
+                        }
+                        0b01 => {
+                            // C.SRAI
+                            let shamt = (((instr >> 12) & 0x1) << 5) | ((instr >> 2) & 0x1f);
+                            em.emit(A64Emitter::ldr_x(9, 0, Self::reg_off(rs1_prime)));
+                            em.mov_imm64(10, shamt as u64);
+                            em.emit(A64Emitter::asrv_x(11, 9, 10));
+                            em.emit(A64Emitter::str_x(11, 0, Self::reg_off(rs1_prime)));
+                            Some(EmitFlow::Continue)
+                        }
+                        0b10 => {
+                            // C.ANDI
+                            em.emit(A64Emitter::ldr_x(9, 0, Self::reg_off(rs1_prime)));
+                            em.mov_imm64(10, imm_ci() as i64 as u64);
+                            em.emit(A64Emitter::and_x(11, 9, 10));
+                            em.emit(A64Emitter::str_x(11, 0, Self::reg_off(rs1_prime)));
+                            Some(EmitFlow::Continue)
+                        }
+                        0b11 => {
+                            let subop = (instr >> 12) & 0x1;
+                            let alu2 = (instr >> 5) & 0x3;
+                            em.emit(A64Emitter::ldr_x(9, 0, Self::reg_off(rs1_prime)));
+                            em.emit(A64Emitter::ldr_x(10, 0, Self::reg_off(rs2_prime)));
+                            match (subop, alu2) {
+                                (0, 0b00) => em.emit(A64Emitter::sub_x(11, 9, 10)), // C.SUB
+                                (0, 0b01) => em.emit(A64Emitter::eor_x(11, 9, 10)), // C.XOR
+                                (0, 0b10) => em.emit(A64Emitter::orr_x(11, 9, 10)), // C.OR
+                                (0, 0b11) => em.emit(A64Emitter::and_x(11, 9, 10)), // C.AND
+                                (1, 0b00) => {
+                                    // C.SUBW
+                                    em.emit(A64Emitter::sub_x(11, 9, 10));
+                                    em.emit(A64Emitter::sxtw_x(11, 11));
+                                }
+                                (1, 0b01) => {
+                                    // C.ADDW
+                                    em.emit(A64Emitter::add_x(11, 9, 10));
+                                    em.emit(A64Emitter::sxtw_x(11, 11));
+                                }
+                                _ => return None,
+                            }
+                            em.emit(A64Emitter::str_x(11, 0, Self::reg_off(rs1_prime)));
+                            Some(EmitFlow::Continue)
+                        }
+                        _ => None,
+                    }
+                }
+                0b101 => {
+                    // C.J
+                    let imm = (((instr >> 12) & 0x1) << 11)
+                        | (((instr >> 11) & 0x1) << 4)
+                        | (((instr >> 10) & 0x1) << 9)
+                        | (((instr >> 9) & 0x1) << 8)
+                        | (((instr >> 8) & 0x1) << 10)
+                        | (((instr >> 7) & 0x1) << 6)
+                        | (((instr >> 6) & 0x1) << 7)
+                        | (((instr >> 5) & 0x1) << 3)
+                        | (((instr >> 4) & 0x1) << 2)
+                        | (((instr >> 3) & 0x1) << 1)
+                        | (((instr >> 2) & 0x1) << 5);
+                    let imm = Self::sign_extend(imm as u64, 12) as u64;
+                    em.mov_imm64(0, pc.wrapping_add(imm));
+                    Some(EmitFlow::Terminate)
+                }
+                0b110 | 0b111 => {
+                    // C.BEQZ / C.BNEZ
+                    let imm = (((instr >> 12) & 0x1) << 8)
+                        | (((instr >> 11) & 0x1) << 4)
+                        | (((instr >> 10) & 0x1) << 3)
+                        | (((instr >> 6) & 0x1) << 7)
+                        | (((instr >> 5) & 0x1) << 6)
+                        | (((instr >> 4) & 0x1) << 2)
+                        | (((instr >> 3) & 0x1) << 1)
+                        | (((instr >> 2) & 0x1) << 5);
+                    let imm = Self::sign_extend(imm as u64, 9) as u64;
+                    em.emit(A64Emitter::ldr_x(9, 0, Self::reg_off(rs1_prime)));
+                    em.mov_imm64(10, 0);
+                    em.emit(A64Emitter::cmp_x(9, 10));
+                    em.mov_imm64(12, pc.wrapping_add(imm));
+                    em.mov_imm64(13, pc.wrapping_add(2));
+                    let cond = if funct3 == 0b110 { C_EQ } else { C_NE };
+                    em.emit(A64Emitter::csel_x(0, 12, 13, cond));
+                    Some(EmitFlow::Terminate)
+                }
+                _ => None,
+            },
+            0b10 => match funct3 {
+                0b000 => {
+                    // C.SLLI
+                    if rd == 0 {
+                        return None;
+                    }
+                    let shamt = (((instr >> 12) & 0x1) << 5) | ((instr >> 2) & 0x1f);
+                    em.emit(A64Emitter::ldr_x(9, 0, Self::reg_off(rd)));
+                    em.mov_imm64(10, shamt as u64);
+                    em.emit(A64Emitter::lslv_x(11, 9, 10));
+                    em.emit(A64Emitter::str_x(11, 0, Self::reg_off(rd)));
+                    Some(EmitFlow::Continue)
+                }
+                0b100 => {
+                    if bit12 == 0 {
+                        if rs2 == 0 {
+                            // C.JR
+                            if rd == 0 {
+                                return None;
+                            }
+                            em.emit(A64Emitter::ldr_x(9, 0, Self::reg_off(rd)));
+                            em.mov_imm64(10, !1u64);
+                            em.emit(A64Emitter::and_x(0, 9, 10));
+                            Some(EmitFlow::Terminate)
+                        } else {
+                            // C.MV
+                            if rd == 0 {
+                                return None;
+                            }
+                            em.emit(A64Emitter::ldr_x(11, 0, Self::reg_off(rs2)));
+                            em.emit(A64Emitter::str_x(11, 0, Self::reg_off(rd)));
+                            Some(EmitFlow::Continue)
+                        }
+                    } else if rs2 == 0 {
+                        if rd == 0 {
+                            // C.EBREAK
+                            if !self.ignore_ebreak {
+                                return None;
+                            }
+                            Some(EmitFlow::Continue)
+                        } else {
+                            // C.JALR
+                            em.emit(A64Emitter::ldr_x(9, 0, Self::reg_off(rd)));
+                            em.mov_imm64(10, !1u64);
+                            em.emit(A64Emitter::and_x(11, 9, 10));
+                            em.mov_imm64(12, pc.wrapping_add(2));
+                            em.emit(A64Emitter::str_x(12, 0, Self::reg_off(1)));
+                            em.emit(A64Emitter::orr_x(0, 11, 31));
+                            Some(EmitFlow::Terminate)
+                        }
+                    } else {
+                        // C.ADD
+                        if rd == 0 {
+                            return None;
+                        }
+                        em.emit(A64Emitter::ldr_x(9, 0, Self::reg_off(rd)));
+                        em.emit(A64Emitter::ldr_x(10, 0, Self::reg_off(rs2)));
+                        em.emit(A64Emitter::add_x(11, 9, 10));
+                        store_rd(em, rd);
+                        Some(EmitFlow::Continue)
+                    }
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn emit_native_term_helper32(
+        &self,
+        em: &mut A64Emitter,
+        pc: u64,
+        instr: u32,
+        d: Decoded32,
+    ) -> bool {
+        match d.opcode as u32 {
+            OPCODE_LOAD | OPCODE_STORE | OPCODE_LOAD_FP | OPCODE_STORE_FP | OPCODE_SYSTEM
+            | OPCODE_AMO => {}
+            _ => return false,
+        }
+
+        // x0=regs_ptr, x1=hart_ptr, x2=bus_data, x3=bus_vtable.
+        // Call helper as:
+        //   x0=hart_ptr, x1=bus_data, x2=bus_vtable, x3=instr, x4=pc
+        // Helper returns NativeBlockResult in x0/x1.
+        em.emit(A64Emitter::mov_x(0, 1));
+        em.emit(A64Emitter::mov_x(1, 2));
+        em.emit(A64Emitter::mov_x(2, 3));
+        em.mov_imm64(3, instr as u64);
+        em.mov_imm64(4, pc);
+        em.mov_imm64(
+            16,
+            Self::native_exec32_term_helper as *const () as usize as u64,
+        );
+        em.emit(A64Emitter::sub_sp_imm(16));
+        em.emit(A64Emitter::str_x(30, 31, 0));
+        em.emit(A64Emitter::blr(16));
+        em.emit(A64Emitter::ldr_x(30, 31, 0));
+        em.emit(A64Emitter::add_sp_imm(16));
+        em.emit(0xD65F_03C0); // ret
+        true
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn emit_native_term_helper16(&self, em: &mut A64Emitter, pc: u64, instr: u16) -> bool {
+        let funct3 = (instr >> 13) & 0x7;
+        let op = instr & 0x3;
+        let supports = match op {
+            0b00 => matches!(funct3, 0b010 | 0b011 | 0b110 | 0b111),
+            0b10 => matches!(funct3, 0b010 | 0b011 | 0b110 | 0b111),
+            _ => false,
+        };
+        if !supports {
+            return false;
+        }
+
+        // x0=regs_ptr, x1=hart_ptr, x2=bus_data, x3=bus_vtable.
+        // Call helper as:
+        //   x0=hart_ptr, x1=bus_data, x2=bus_vtable, x3=instr16, x4=pc
+        // Helper returns NativeBlockResult in x0/x1.
+        em.emit(A64Emitter::mov_x(0, 1));
+        em.emit(A64Emitter::mov_x(1, 2));
+        em.emit(A64Emitter::mov_x(2, 3));
+        em.mov_imm64(3, instr as u64);
+        em.mov_imm64(4, pc);
+        em.mov_imm64(
+            16,
+            Self::native_exec16_term_helper as *const () as usize as u64,
+        );
+        em.emit(A64Emitter::sub_sp_imm(16));
+        em.emit(A64Emitter::str_x(30, 31, 0));
+        em.emit(A64Emitter::blr(16));
+        em.emit(A64Emitter::ldr_x(30, 31, 0));
+        em.emit(A64Emitter::add_sp_imm(16));
+        em.emit(0xD65F_03C0); // ret
+        true
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe extern "C" fn native_exec32_term_helper(
+        hart_ptr: *mut Hart,
+        bus_data: *mut (),
+        bus_vtable: *mut (),
+        instr: u64,
+        pc: u64,
+    ) -> NativeBlockResult {
+        if hart_ptr.is_null() || bus_data.is_null() || bus_vtable.is_null() {
+            return NativeBlockResult {
+                next_pc: pc,
+                executed: 0,
+            };
+        }
+
+        let hart = unsafe { &mut *hart_ptr };
+        let bus_ptr: *mut dyn Bus = unsafe {
+            std::mem::transmute::<(*mut (), *mut ()), *mut dyn Bus>((bus_data, bus_vtable))
+        };
+        let bus = unsafe { &mut *bus_ptr };
+
+        let instr = instr as u32;
+        let d = Self::decode32(instr);
+        let mut sbi = NativeJitHelperSbi;
+        let next_pc = match hart.exec32_decoded(bus, &mut sbi, instr, d) {
+            Ok(v) => v,
+            Err(_) => {
+                return NativeBlockResult {
+                    next_pc: pc,
+                    executed: 0,
+                };
+            }
+        };
+        NativeBlockResult {
+            next_pc,
+            executed: 1,
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe extern "C" fn native_exec16_term_helper(
+        hart_ptr: *mut Hart,
+        bus_data: *mut (),
+        bus_vtable: *mut (),
+        instr: u64,
+        pc: u64,
+    ) -> NativeBlockResult {
+        if hart_ptr.is_null() || bus_data.is_null() || bus_vtable.is_null() {
+            return NativeBlockResult {
+                next_pc: pc,
+                executed: 0,
+            };
+        }
+
+        let hart = unsafe { &mut *hart_ptr };
+        let bus_ptr: *mut dyn Bus = unsafe {
+            std::mem::transmute::<(*mut (), *mut ()), *mut dyn Bus>((bus_data, bus_vtable))
+        };
+        let bus = unsafe { &mut *bus_ptr };
+        let instr = instr as u16;
+        let funct3 = (instr >> 13) & 0x7;
+        let op = instr & 0x3;
+        let rd = ((instr >> 7) & 0x1f) as usize;
+        let rs2 = ((instr >> 2) & 0x1f) as usize;
+        let rd_prime = (((instr >> 2) & 0x7) + 8) as usize;
+        let rs1_prime = (((instr >> 7) & 0x7) + 8) as usize;
+        let rs2_prime = (((instr >> 2) & 0x7) + 8) as usize;
+        let next_pc = pc.wrapping_add(2);
+
+        let res: Result<(), Trap> = (|| {
+            match op {
+                0b00 => match funct3 {
+                    0b010 => {
+                        // C.LW
+                        let imm = (((instr >> 10) & 0x7) << 3)
+                            | (((instr >> 6) & 0x1) << 2)
+                            | (((instr >> 5) & 0x1) << 6);
+                        let addr = hart.regs[rs1_prime].wrapping_add(imm as u64);
+                        let val = hart.read_u32(bus, addr, AccessType::Load)? as i32 as i64 as u64;
+                        hart.regs[rd_prime] = val;
+                        Ok(())
+                    }
+                    0b011 => {
+                        // C.LD
+                        let imm = (((instr >> 10) & 0x7) << 3)
+                            | (((instr >> 5) & 0x1) << 6)
+                            | (((instr >> 6) & 0x1) << 7);
+                        let addr = hart.regs[rs1_prime].wrapping_add(imm as u64);
+                        let val = hart.read_u64(bus, addr, AccessType::Load)?;
+                        hart.regs[rd_prime] = val;
+                        Ok(())
+                    }
+                    0b110 => {
+                        // C.SW
+                        let imm = (((instr >> 10) & 0x7) << 3)
+                            | (((instr >> 6) & 0x1) << 2)
+                            | (((instr >> 5) & 0x1) << 6);
+                        let addr = hart.regs[rs1_prime].wrapping_add(imm as u64);
+                        let val = hart.regs[rs2_prime] as u32;
+                        hart.write_u32(bus, addr, val, AccessType::Store)?;
+                        Ok(())
+                    }
+                    0b111 => {
+                        // C.SD
+                        let imm = (((instr >> 10) & 0x7) << 3)
+                            | (((instr >> 5) & 0x1) << 6)
+                            | (((instr >> 6) & 0x1) << 7);
+                        let addr = hart.regs[rs1_prime].wrapping_add(imm as u64);
+                        let val = hart.regs[rs2_prime];
+                        hart.write_u64(bus, addr, val, AccessType::Store)?;
+                        Ok(())
+                    }
+                    _ => Err(Trap::IllegalInstruction(instr as u32)),
+                },
+                0b10 => match funct3 {
+                    0b010 => {
+                        // C.LWSP
+                        if rd == 0 {
+                            return Err(Trap::IllegalInstruction(instr as u32));
+                        }
+                        let imm = (((instr >> 12) & 0x1) << 5)
+                            | (((instr >> 6) & 0x1) << 4)
+                            | (((instr >> 5) & 0x1) << 3)
+                            | (((instr >> 4) & 0x1) << 2)
+                            | (((instr >> 3) & 0x1) << 7)
+                            | (((instr >> 2) & 0x1) << 6);
+                        let addr = hart.regs[2].wrapping_add(imm as u64);
+                        let val = hart.read_u32(bus, addr, AccessType::Load)? as i32 as i64 as u64;
+                        hart.regs[rd] = val;
+                        Ok(())
+                    }
+                    0b011 => {
+                        // C.LDSP
+                        if rd == 0 {
+                            return Err(Trap::IllegalInstruction(instr as u32));
+                        }
+                        let imm = (((instr >> 12) & 0x1) << 5)
+                            | (((instr >> 6) & 0x1) << 4)
+                            | (((instr >> 5) & 0x1) << 3)
+                            | (((instr >> 4) & 0x1) << 8)
+                            | (((instr >> 3) & 0x1) << 7)
+                            | (((instr >> 2) & 0x1) << 6);
+                        let addr = hart.regs[2].wrapping_add(imm as u64);
+                        let val = hart.read_u64(bus, addr, AccessType::Load)?;
+                        hart.regs[rd] = val;
+                        Ok(())
+                    }
+                    0b110 => {
+                        // C.SWSP
+                        let imm = (((instr >> 12) & 0x1) << 5)
+                            | (((instr >> 11) & 0x1) << 4)
+                            | (((instr >> 10) & 0x1) << 3)
+                            | (((instr >> 9) & 0x1) << 2)
+                            | (((instr >> 8) & 0x1) << 7)
+                            | (((instr >> 7) & 0x1) << 6);
+                        let addr = hart.regs[2].wrapping_add(imm as u64);
+                        let val = hart.regs[rs2] as u32;
+                        hart.write_u32(bus, addr, val, AccessType::Store)?;
+                        Ok(())
+                    }
+                    0b111 => {
+                        // C.SDSP
+                        let imm = (((instr >> 12) & 0x1) << 5)
+                            | (((instr >> 11) & 0x1) << 4)
+                            | (((instr >> 10) & 0x1) << 3)
+                            | (((instr >> 9) & 0x1) << 8)
+                            | (((instr >> 8) & 0x1) << 7)
+                            | (((instr >> 7) & 0x1) << 6);
+                        let addr = hart.regs[2].wrapping_add(imm as u64);
+                        let val = hart.regs[rs2];
+                        hart.write_u64(bus, addr, val, AccessType::Store)?;
+                        Ok(())
+                    }
+                    _ => Err(Trap::IllegalInstruction(instr as u32)),
+                },
+                _ => Err(Trap::IllegalInstruction(instr as u32)),
+            }
+        })();
+
+        if res.is_err() {
+            NativeBlockResult {
+                next_pc: pc,
+                executed: 0,
+            }
+        } else {
+            NativeBlockResult {
+                next_pc,
+                executed: 1,
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn emit_native_instr(
+        &self,
+        em: &mut A64Emitter,
+        pc: u64,
+        instr: u32,
+        d: Decoded32,
+    ) -> Option<EmitFlow> {
+        const C_EQ: u8 = 0x0;
+        const C_NE: u8 = 0x1;
+        const C_CS: u8 = 0x2;
+        const C_CC: u8 = 0x3;
+        const C_MI: u8 = 0x4;
+        const C_GE: u8 = 0xA;
+        const C_LT: u8 = 0xB;
         let rd = d.rd as usize;
         let rs1 = d.rs1 as usize;
         let rs2 = d.rs2 as usize;
@@ -788,14 +1501,52 @@ impl Hart {
                     em.mov_imm64(11, Self::imm_u(instr) as u64);
                     em.emit(A64Emitter::str_x(11, 0, Self::reg_off(rd)));
                 }
-                true
+                Some(EmitFlow::Continue)
             }
             OPCODE_AUIPC => {
                 if rd != 0 {
                     em.mov_imm64(11, pc.wrapping_add(Self::imm_u(instr) as u64));
                     em.emit(A64Emitter::str_x(11, 0, Self::reg_off(rd)));
                 }
-                true
+                Some(EmitFlow::Continue)
+            }
+            OPCODE_JAL => {
+                if rd != 0 {
+                    em.mov_imm64(11, pc.wrapping_add(4));
+                    em.emit(A64Emitter::str_x(11, 0, Self::reg_off(rd)));
+                }
+                em.mov_imm64(0, pc.wrapping_add(Self::imm_j(instr) as u64));
+                Some(EmitFlow::Terminate)
+            }
+            OPCODE_JALR => {
+                em.emit(A64Emitter::ldr_x(9, 0, Self::reg_off(rs1)));
+                if rd != 0 {
+                    em.mov_imm64(11, pc.wrapping_add(4));
+                    em.emit(A64Emitter::str_x(11, 0, Self::reg_off(rd)));
+                }
+                em.mov_imm64(10, Self::imm_i(instr) as u64);
+                em.emit(A64Emitter::add_x(11, 9, 10));
+                em.mov_imm64(12, !1u64);
+                em.emit(A64Emitter::and_x(0, 11, 12));
+                Some(EmitFlow::Terminate)
+            }
+            OPCODE_BRANCH => {
+                let cond = match funct3 {
+                    F3_BEQ => C_EQ,
+                    F3_BNE => C_NE,
+                    F3_BLT => C_LT,
+                    F3_BGE => C_GE,
+                    F3_BLTU => C_CC,
+                    F3_BGEU => C_CS,
+                    _ => return None,
+                };
+                em.emit(A64Emitter::ldr_x(9, 0, Self::reg_off(rs1)));
+                em.emit(A64Emitter::ldr_x(10, 0, Self::reg_off(rs2)));
+                em.emit(A64Emitter::cmp_x(9, 10));
+                em.mov_imm64(12, pc.wrapping_add(Self::imm_b(instr) as u64));
+                em.mov_imm64(13, pc.wrapping_add(4));
+                em.emit(A64Emitter::csel_x(0, 12, 13, cond));
+                Some(EmitFlow::Terminate)
             }
             OPCODE_OP_IMM => {
                 em.emit(A64Emitter::ldr_x(9, 0, Self::reg_off(rs1)));
@@ -803,6 +1554,20 @@ impl Hart {
                     F3_ADD_SUB => {
                         em.mov_imm64(10, Self::imm_i(instr) as u64);
                         em.emit(A64Emitter::add_x(11, 9, 10));
+                    }
+                    F3_SLT => {
+                        em.mov_imm64(10, Self::imm_i(instr) as u64);
+                        em.emit(A64Emitter::cmp_x(9, 10));
+                        em.mov_imm64(12, 1);
+                        em.mov_imm64(13, 0);
+                        em.emit(A64Emitter::csel_x(11, 12, 13, C_LT));
+                    }
+                    F3_SLTU => {
+                        em.mov_imm64(10, Self::imm_i(instr) as u64);
+                        em.emit(A64Emitter::cmp_x(9, 10));
+                        em.mov_imm64(12, 1);
+                        em.mov_imm64(13, 0);
+                        em.emit(A64Emitter::csel_x(11, 12, 13, C_CC));
                     }
                     F3_XOR => {
                         em.mov_imm64(10, Self::imm_i(instr) as u64);
@@ -818,7 +1583,7 @@ impl Hart {
                     }
                     F3_SLL => {
                         if imm_hi != 0 {
-                            return false;
+                            return None;
                         }
                         em.mov_imm64(10, (imm12 & 0x3f) as u64);
                         em.emit(A64Emitter::lslv_x(11, 9, 10));
@@ -828,13 +1593,142 @@ impl Hart {
                         match imm_hi {
                             0x00 => em.emit(A64Emitter::lsrv_x(11, 9, 10)),
                             0x10 => em.emit(A64Emitter::asrv_x(11, 9, 10)),
-                            _ => return false,
+                            _ => return None,
                         }
                     }
-                    _ => return false,
+                    _ => return None,
                 }
                 store_rd(em, rd);
-                true
+                Some(EmitFlow::Continue)
+            }
+            OPCODE_OP_IMM_32 => {
+                em.emit(A64Emitter::ldr_x(9, 0, Self::reg_off(rs1)));
+                match funct3 {
+                    F3_ADD_SUB => {
+                        em.mov_imm64(10, Self::imm_i(instr) as u64);
+                        em.emit(A64Emitter::add_x(11, 9, 10));
+                        em.emit(A64Emitter::sxtw_x(11, 11));
+                    }
+                    F3_SLL => {
+                        if funct7 != F7_BASE {
+                            return None;
+                        }
+                        em.mov_imm64(10, (imm12 & 0x1f) as u64);
+                        em.emit(A64Emitter::lslv_x(11, 9, 10));
+                        em.emit(A64Emitter::sxtw_x(11, 11));
+                    }
+                    F3_SRL_SRA => {
+                        em.mov_imm64(10, (imm12 & 0x1f) as u64);
+                        match funct7 {
+                            F7_BASE => {
+                                em.mov_imm64(12, 0xffff_ffff);
+                                em.emit(A64Emitter::and_x(11, 9, 12));
+                                em.emit(A64Emitter::lsrv_x(11, 11, 10));
+                                em.emit(A64Emitter::sxtw_x(11, 11));
+                            }
+                            F7_SUB_SRA => {
+                                em.emit(A64Emitter::sxtw_x(11, 9));
+                                em.emit(A64Emitter::asrv_x(11, 11, 10));
+                                em.emit(A64Emitter::sxtw_x(11, 11));
+                            }
+                            _ => return None,
+                        }
+                    }
+                    _ => return None,
+                }
+                store_rd(em, rd);
+                Some(EmitFlow::Continue)
+            }
+            OPCODE_OP_32 => {
+                em.emit(A64Emitter::ldr_x(9, 0, Self::reg_off(rs1)));
+                em.emit(A64Emitter::ldr_x(10, 0, Self::reg_off(rs2)));
+                match (funct7, funct3) {
+                    (F7_BASE, F3_ADD_SUB) => {
+                        em.emit(A64Emitter::add_x(11, 9, 10));
+                        em.emit(A64Emitter::sxtw_x(11, 11));
+                    }
+                    (F7_SUB_SRA, F3_ADD_SUB) => {
+                        em.emit(A64Emitter::sub_x(11, 9, 10));
+                        em.emit(A64Emitter::sxtw_x(11, 11));
+                    }
+                    (F7_BASE, F3_SLL) => {
+                        em.mov_imm64(12, 31);
+                        em.emit(A64Emitter::and_x(10, 10, 12));
+                        em.emit(A64Emitter::lslv_x(11, 9, 10));
+                        em.emit(A64Emitter::sxtw_x(11, 11));
+                    }
+                    (F7_BASE, F3_SRL_SRA) => {
+                        em.mov_imm64(12, 0xffff_ffff);
+                        em.emit(A64Emitter::and_x(11, 9, 12));
+                        em.mov_imm64(13, 31);
+                        em.emit(A64Emitter::and_x(10, 10, 13));
+                        em.emit(A64Emitter::lsrv_x(11, 11, 10));
+                        em.emit(A64Emitter::sxtw_x(11, 11));
+                    }
+                    (F7_SUB_SRA, F3_SRL_SRA) => {
+                        em.emit(A64Emitter::sxtw_x(11, 9));
+                        em.mov_imm64(12, 31);
+                        em.emit(A64Emitter::and_x(10, 10, 12));
+                        em.emit(A64Emitter::asrv_x(11, 11, 10));
+                        em.emit(A64Emitter::sxtw_x(11, 11));
+                    }
+                    (F7_MULDIV, F3_ADD_SUB) => {
+                        // MULW
+                        em.emit(A64Emitter::mul_x(11, 9, 10));
+                        em.emit(A64Emitter::sxtw_x(11, 11));
+                    }
+                    (F7_MULDIV, F3_XOR) => {
+                        // DIVW
+                        em.emit(A64Emitter::sxtw_x(9, 9));
+                        em.emit(A64Emitter::sxtw_x(10, 10));
+                        em.emit(A64Emitter::sdiv_x(11, 9, 10));
+                        em.mov_imm64(12, 0);
+                        em.emit(A64Emitter::cmp_x(10, 12));
+                        em.mov_imm64(13, u64::MAX);
+                        em.emit(A64Emitter::csel_x(11, 13, 11, C_EQ));
+                        em.emit(A64Emitter::sxtw_x(11, 11));
+                    }
+                    (F7_MULDIV, F3_SRL_SRA) => {
+                        // DIVUW
+                        em.mov_imm64(12, 0xffff_ffff);
+                        em.emit(A64Emitter::and_x(9, 9, 12));
+                        em.emit(A64Emitter::and_x(10, 10, 12));
+                        em.emit(A64Emitter::udiv_x(11, 9, 10));
+                        em.mov_imm64(13, 0);
+                        em.emit(A64Emitter::cmp_x(10, 13));
+                        em.mov_imm64(14, u64::MAX);
+                        em.emit(A64Emitter::csel_x(11, 14, 11, C_EQ));
+                        em.emit(A64Emitter::sxtw_x(11, 11));
+                    }
+                    (F7_MULDIV, F3_OR) => {
+                        // REMW
+                        em.emit(A64Emitter::sxtw_x(9, 9));
+                        em.emit(A64Emitter::sxtw_x(10, 10));
+                        em.emit(A64Emitter::sdiv_x(12, 9, 10));
+                        em.emit(A64Emitter::mul_x(12, 12, 10));
+                        em.emit(A64Emitter::sub_x(11, 9, 12));
+                        em.mov_imm64(13, 0);
+                        em.emit(A64Emitter::cmp_x(10, 13));
+                        em.emit(A64Emitter::csel_x(11, 9, 11, C_EQ));
+                        em.emit(A64Emitter::sxtw_x(11, 11));
+                    }
+                    (F7_MULDIV, F3_AND) => {
+                        // REMUW
+                        em.mov_imm64(12, 0xffff_ffff);
+                        em.emit(A64Emitter::and_x(9, 9, 12));
+                        em.emit(A64Emitter::and_x(10, 10, 12));
+                        em.emit(A64Emitter::udiv_x(13, 9, 10));
+                        em.emit(A64Emitter::mul_x(13, 13, 10));
+                        em.emit(A64Emitter::sub_x(11, 9, 13));
+                        em.mov_imm64(14, 0);
+                        em.emit(A64Emitter::cmp_x(10, 14));
+                        em.emit(A64Emitter::csel_x(11, 9, 11, C_EQ));
+                        em.emit(A64Emitter::sxtw_x(11, 11));
+                    }
+                    _ => return None,
+                }
+                store_rd(em, rd);
+                Some(EmitFlow::Continue)
             }
             OPCODE_OP => {
                 em.emit(A64Emitter::ldr_x(9, 0, Self::reg_off(rs1)));
@@ -842,24 +1736,121 @@ impl Hart {
                 match (funct7, funct3) {
                     (F7_BASE, F3_ADD_SUB) => em.emit(A64Emitter::add_x(11, 9, 10)),
                     (F7_SUB_SRA, F3_ADD_SUB) => em.emit(A64Emitter::sub_x(11, 9, 10)),
+                    (F7_BASE, F3_SLT) => {
+                        em.emit(A64Emitter::cmp_x(9, 10));
+                        em.mov_imm64(12, 1);
+                        em.mov_imm64(13, 0);
+                        em.emit(A64Emitter::csel_x(11, 12, 13, C_LT));
+                    }
+                    (F7_BASE, F3_SLTU) => {
+                        em.emit(A64Emitter::cmp_x(9, 10));
+                        em.mov_imm64(12, 1);
+                        em.mov_imm64(13, 0);
+                        em.emit(A64Emitter::csel_x(11, 12, 13, C_CC));
+                    }
                     (F7_BASE, F3_AND) => em.emit(A64Emitter::and_x(11, 9, 10)),
                     (F7_BASE, F3_OR) => em.emit(A64Emitter::orr_x(11, 9, 10)),
                     (F7_BASE, F3_XOR) => em.emit(A64Emitter::eor_x(11, 9, 10)),
                     (F7_BASE, F3_SLL) => em.emit(A64Emitter::lslv_x(11, 9, 10)),
                     (F7_BASE, F3_SRL_SRA) => em.emit(A64Emitter::lsrv_x(11, 9, 10)),
                     (F7_SUB_SRA, F3_SRL_SRA) => em.emit(A64Emitter::asrv_x(11, 9, 10)),
-                    _ => return false,
+                    (F7_MULDIV, F3_ADD_SUB) => em.emit(A64Emitter::mul_x(11, 9, 10)),
+                    (F7_MULDIV, F3_SLL) => em.emit(A64Emitter::smulh_x(11, 9, 10)),
+                    (F7_MULDIV, F3_SLT) => {
+                        // MULHSU = high64((rs1 as i64) * (rs2 as u64))
+                        em.emit(A64Emitter::umulh_x(11, 9, 10));
+                        em.mov_imm64(12, 0);
+                        em.emit(A64Emitter::cmp_x(9, 12));
+                        em.mov_imm64(13, 0);
+                        em.emit(A64Emitter::csel_x(12, 10, 13, C_MI));
+                        em.emit(A64Emitter::sub_x(11, 11, 12));
+                    }
+                    (F7_MULDIV, F3_SLTU) => em.emit(A64Emitter::umulh_x(11, 9, 10)),
+                    (F7_MULDIV, F3_XOR) => {
+                        // DIV
+                        em.emit(A64Emitter::sdiv_x(11, 9, 10));
+                        em.mov_imm64(12, 0);
+                        em.emit(A64Emitter::cmp_x(10, 12));
+                        em.mov_imm64(13, u64::MAX);
+                        em.emit(A64Emitter::csel_x(11, 13, 11, C_EQ));
+                        em.mov_imm64(12, i64::MIN as u64);
+                        em.emit(A64Emitter::cmp_x(9, 12));
+                        em.mov_imm64(14, 1);
+                        em.mov_imm64(15, 0);
+                        em.emit(A64Emitter::csel_x(14, 14, 15, C_EQ));
+                        em.mov_imm64(12, u64::MAX);
+                        em.emit(A64Emitter::cmp_x(10, 12));
+                        em.mov_imm64(15, 1);
+                        em.mov_imm64(16, 0);
+                        em.emit(A64Emitter::csel_x(15, 15, 16, C_EQ));
+                        em.emit(A64Emitter::and_x(14, 14, 15));
+                        em.mov_imm64(16, 1);
+                        em.emit(A64Emitter::cmp_x(14, 16));
+                        em.emit(A64Emitter::csel_x(11, 9, 11, C_EQ));
+                    }
+                    (F7_MULDIV, F3_SRL_SRA) => {
+                        // DIVU
+                        em.emit(A64Emitter::udiv_x(11, 9, 10));
+                        em.mov_imm64(12, 0);
+                        em.emit(A64Emitter::cmp_x(10, 12));
+                        em.mov_imm64(13, u64::MAX);
+                        em.emit(A64Emitter::csel_x(11, 13, 11, C_EQ));
+                    }
+                    (F7_MULDIV, F3_OR) => {
+                        // REM
+                        em.emit(A64Emitter::sdiv_x(12, 9, 10));
+                        em.emit(A64Emitter::mul_x(12, 12, 10));
+                        em.emit(A64Emitter::sub_x(11, 9, 12));
+                        em.mov_imm64(13, 0);
+                        em.emit(A64Emitter::cmp_x(10, 13));
+                        em.emit(A64Emitter::csel_x(11, 9, 11, C_EQ));
+                        em.mov_imm64(12, i64::MIN as u64);
+                        em.emit(A64Emitter::cmp_x(9, 12));
+                        em.mov_imm64(14, 1);
+                        em.mov_imm64(15, 0);
+                        em.emit(A64Emitter::csel_x(14, 14, 15, C_EQ));
+                        em.mov_imm64(12, u64::MAX);
+                        em.emit(A64Emitter::cmp_x(10, 12));
+                        em.mov_imm64(15, 1);
+                        em.mov_imm64(16, 0);
+                        em.emit(A64Emitter::csel_x(15, 15, 16, C_EQ));
+                        em.emit(A64Emitter::and_x(14, 14, 15));
+                        em.mov_imm64(16, 1);
+                        em.emit(A64Emitter::cmp_x(14, 16));
+                        em.mov_imm64(17, 0);
+                        em.emit(A64Emitter::csel_x(11, 17, 11, C_EQ));
+                    }
+                    (F7_MULDIV, F3_AND) => {
+                        // REMU
+                        em.emit(A64Emitter::udiv_x(12, 9, 10));
+                        em.emit(A64Emitter::mul_x(12, 12, 10));
+                        em.emit(A64Emitter::sub_x(11, 9, 12));
+                        em.mov_imm64(13, 0);
+                        em.emit(A64Emitter::cmp_x(10, 13));
+                        em.emit(A64Emitter::csel_x(11, 9, 11, C_EQ));
+                    }
+                    _ => return None,
                 }
                 store_rd(em, rd);
-                true
+                Some(EmitFlow::Continue)
             }
-            _ => false,
+            OPCODE_MISC_MEM => match funct3 {
+                F3_FENCE | F3_FENCE_I => Some(EmitFlow::Continue),
+                _ => None,
+            },
+            _ => None,
         }
     }
 
     #[cfg(not(target_arch = "aarch64"))]
-    fn emit_native_instr(&self, _em: &mut (), _pc: u64, _instr: u32, _d: Decoded32) -> bool {
-        false
+    fn emit_native_instr(
+        &self,
+        _em: &mut (),
+        _pc: u64,
+        _instr: u32,
+        _d: Decoded32,
+    ) -> Option<EmitFlow> {
+        None
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -885,42 +1876,86 @@ impl Hart {
         let start_pc = self.pc;
         let mut pc = start_pc;
         let mut emitted = 0u32;
+        let mut terminated = false;
+        let mut helper_terminator = false;
         let mut em = A64Emitter::new();
+        let mut instr_log: Vec<(u64, u32, u8)> = Vec::new();
 
         while emitted < max_steps {
-            if (pc & 0x3) != 0 {
+            if (pc & 0x1) != 0 {
                 if emitted == 0 {
-                    self.check_align(pc, 4)?;
+                    self.check_align(pc, 2)?;
                 }
                 break;
             }
-            let instr = match self.read_u32(bus, pc, AccessType::Fetch) {
+            let instr16 = match self.read_u16(bus, pc, AccessType::Fetch) {
                 Ok(v) => v,
                 Err(t) => {
                     if emitted == 0 {
                         if self.native_jit_trace {
-                            eprintln!(
-                                "jit-a64: skip pc=0x{:016x} fetch-trap={:?}",
-                                pc, t
-                            );
+                            eprintln!("jit-a64: skip pc=0x{:016x} fetch-trap={:?}", pc, t);
                         }
                         return Err(t);
                     }
                     break;
                 }
             };
-            if (instr & 0x3) != 0x3 {
-                if emitted == 0 && self.native_jit_trace {
-                    eprintln!(
-                        "jit-a64: skip pc=0x{:016x} compressed instr16=0x{:04x}",
-                        pc,
-                        (instr & 0xffff) as u16
-                    );
+
+            if (instr16 & 0x3) != 0x3 {
+                let Some(flow) = self.emit_native_instr16(&mut em, pc, instr16) else {
+                    if emitted == 0 && self.emit_native_term_helper16(&mut em, pc, instr16) {
+                        helper_terminator = true;
+                        terminated = true;
+                        emitted = 1;
+                        if self.native_jit_trace {
+                            instr_log.push((pc, instr16 as u32, 2));
+                        }
+                        break;
+                    }
+                    if emitted == 0 && self.native_jit_trace {
+                        eprintln!(
+                            "jit-a64: skip pc=0x{:016x} unsupported c16=0x{:04x}",
+                            pc, instr16
+                        );
+                    }
+                    break;
+                };
+                if self.native_jit_trace {
+                    instr_log.push((pc, instr16 as u32, 2));
                 }
-                break;
+                pc = pc.wrapping_add(2);
+                emitted += 1;
+                if flow == EmitFlow::Terminate {
+                    terminated = true;
+                    break;
+                }
+                continue;
             }
+
+            let upper = match self.read_u16(bus, pc.wrapping_add(2), AccessType::Fetch) {
+                Ok(v) => v as u32,
+                Err(t) => {
+                    if emitted == 0 {
+                        if self.native_jit_trace {
+                            eprintln!("jit-a64: skip pc=0x{:016x} fetch-trap={:?}", pc, t);
+                        }
+                        return Err(t);
+                    }
+                    break;
+                }
+            };
+            let instr = (upper << 16) | instr16 as u32;
             let d = Self::decode32(instr);
-            if !self.emit_native_instr(&mut em, pc, instr, d) {
+            let Some(flow) = self.emit_native_instr(&mut em, pc, instr, d) else {
+                if emitted == 0 && self.emit_native_term_helper32(&mut em, pc, instr, d) {
+                    helper_terminator = true;
+                    terminated = true;
+                    emitted = 1;
+                    if self.native_jit_trace {
+                        instr_log.push((pc, instr, 4));
+                    }
+                    break;
+                }
                 if emitted == 0 && self.native_jit_trace {
                     eprintln!(
                         "jit-a64: skip pc=0x{:016x} unsupported i32=0x{:08x}",
@@ -928,18 +1963,30 @@ impl Hart {
                     );
                 }
                 break;
+            };
+            if self.native_jit_trace {
+                instr_log.push((pc, instr, 4));
             }
             pc = pc.wrapping_add(4);
             emitted += 1;
+            if flow == EmitFlow::Terminate {
+                terminated = true;
+                break;
+            }
         }
 
         if emitted < 1 {
+            self.native_jit.mark_failed(satp, start_pc);
             return Ok(None);
         }
 
-        em.mov_imm64(0, pc);
-        em.mov_imm64(1, emitted as u64);
-        em.emit(0xD65F_03C0); // ret
+        if !helper_terminator {
+            if !terminated {
+                em.mov_imm64(0, pc);
+            }
+            em.mov_imm64(1, emitted as u64);
+            em.emit(0xD65F_03C0); // ret
+        }
         let code = em.finish();
 
         let Some(cache) = self.native_jit.cache.as_mut() else {
@@ -971,6 +2018,23 @@ impl Hart {
                 "jit-a64: compiled hart={} satp=0x{:016x} pc=0x{:016x} instrs={}",
                 self.hart_id, satp, start_pc, emitted
             );
+            for (ipc, raw, len) in instr_log {
+                if len == 2 {
+                    eprintln!(
+                        "  jit-a64:   pc=0x{:016x} c16=0x{:04x} {}",
+                        ipc,
+                        raw as u16,
+                        disas::disas16(raw as u16)
+                    );
+                } else {
+                    eprintln!(
+                        "  jit-a64:   pc=0x{:016x} i32=0x{:08x} {}",
+                        ipc,
+                        raw,
+                        disas::disas32(raw)
+                    );
+                }
+            }
         }
         Ok(Some(block))
     }
@@ -1029,7 +2093,22 @@ impl Hart {
             let start_pc = self.pc;
             let mut block = self.native_jit.lookup(satp, start_pc);
             if block.is_none() {
-                block = self.compile_native_block(bus, budget)?;
+                if self.native_jit.is_failed(satp, start_pc) {
+                    return Ok(None);
+                }
+                if self.native_jit_hot_threshold > 1 {
+                    let seen = self.native_jit.bump_hot(satp, start_pc);
+                    if seen < self.native_jit_hot_threshold {
+                        return Ok(None);
+                    }
+                }
+                block = match self.compile_native_block(bus, budget) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        self.native_jit.mark_failed(satp, start_pc);
+                        None
+                    }
+                };
             }
             let Some(block) = block else {
                 return Ok(None);
@@ -1042,9 +2121,20 @@ impl Hart {
                 self.native_jit.enabled = false;
                 return Ok(None);
             };
+            cache.prepare_execute();
             let fn_ptr = cache.ptr_at(block.offset);
             let func: NativeBlockFn = unsafe { std::mem::transmute(fn_ptr) };
-            let res = unsafe { func(self.regs.as_mut_ptr()) };
+            let bus_dyn: &mut dyn Bus = bus;
+            let (bus_data, bus_vtable): (*mut (), *mut ()) =
+                unsafe { std::mem::transmute::<*mut dyn Bus, (*mut (), *mut ())>(bus_dyn) };
+            let res = unsafe {
+                func(
+                    self.regs.as_mut_ptr(),
+                    self as *mut Hart,
+                    bus_data,
+                    bus_vtable,
+                )
+            };
             if res.executed != block.instrs as u64 || res.executed == 0 {
                 return Ok(None);
             }
@@ -1236,11 +2326,16 @@ impl Hart {
         }
     }
 
-    fn read_phys_u64(&mut self, bus: &mut impl Bus, addr: u64) -> Result<u64, Trap> {
+    fn read_phys_u64(&mut self, bus: &mut (impl Bus + ?Sized), addr: u64) -> Result<u64, Trap> {
         bus.read_u64(self.hart_id, addr, AccessType::Debug)
     }
 
-    fn write_phys_u64(&mut self, bus: &mut impl Bus, addr: u64, value: u64) -> Result<(), Trap> {
+    fn write_phys_u64(
+        &mut self,
+        bus: &mut (impl Bus + ?Sized),
+        addr: u64,
+        value: u64,
+    ) -> Result<(), Trap> {
         bus.write_u64(self.hart_id, addr, value, AccessType::Debug)
     }
 
@@ -1256,7 +2351,7 @@ impl Hart {
 
     fn translate_addr(
         &mut self,
-        bus: &mut impl Bus,
+        bus: &mut (impl Bus + ?Sized),
         vaddr: u64,
         kind: AccessType,
     ) -> Result<u64, Trap> {
@@ -1269,10 +2364,7 @@ impl Hart {
         if mmu_trace {
             eprintln!(
                 "mmu: vaddr=0x{:016x} kind={:?} priv={:?} satp=0x{:016x}",
-                vaddr,
-                kind,
-                self.priv_mode,
-                self.satp_cached
+                vaddr, kind, self.priv_mode, self.satp_cached
             );
         }
         if self.priv_mode == PrivMode::Machine {
@@ -1457,14 +2549,24 @@ impl Hart {
     }
 
     #[inline]
-    fn read_u8(&mut self, bus: &mut impl Bus, addr: u64, kind: AccessType) -> Result<u8, Trap> {
+    fn read_u8(
+        &mut self,
+        bus: &mut (impl Bus + ?Sized),
+        addr: u64,
+        kind: AccessType,
+    ) -> Result<u8, Trap> {
         self.last_access = Some((kind, addr, 1));
         let paddr = self.translate_addr(bus, addr, kind)?;
         bus.read_u8(self.hart_id, paddr, kind)
     }
 
     #[inline]
-    fn read_u16(&mut self, bus: &mut impl Bus, addr: u64, kind: AccessType) -> Result<u16, Trap> {
+    fn read_u16(
+        &mut self,
+        bus: &mut (impl Bus + ?Sized),
+        addr: u64,
+        kind: AccessType,
+    ) -> Result<u16, Trap> {
         self.last_access = Some((kind, addr, 2));
         self.check_align(addr, 2)?;
         let paddr = self.translate_addr(bus, addr, kind)?;
@@ -1472,7 +2574,12 @@ impl Hart {
     }
 
     #[inline]
-    fn read_u32(&mut self, bus: &mut impl Bus, addr: u64, kind: AccessType) -> Result<u32, Trap> {
+    fn read_u32(
+        &mut self,
+        bus: &mut (impl Bus + ?Sized),
+        addr: u64,
+        kind: AccessType,
+    ) -> Result<u32, Trap> {
         self.last_access = Some((kind, addr, 4));
         self.check_align(addr, 4)?;
         let paddr = self.translate_addr(bus, addr, kind)?;
@@ -1481,7 +2588,12 @@ impl Hart {
 
     #[inline]
     #[allow(dead_code)]
-    fn read_u64(&mut self, bus: &mut impl Bus, addr: u64, kind: AccessType) -> Result<u64, Trap> {
+    fn read_u64(
+        &mut self,
+        bus: &mut (impl Bus + ?Sized),
+        addr: u64,
+        kind: AccessType,
+    ) -> Result<u64, Trap> {
         self.last_access = Some((kind, addr, 8));
         self.check_align(addr, 8)?;
         let paddr = self.translate_addr(bus, addr, kind)?;
@@ -1491,7 +2603,7 @@ impl Hart {
     #[inline]
     fn write_u8(
         &mut self,
-        bus: &mut impl Bus,
+        bus: &mut (impl Bus + ?Sized),
         addr: u64,
         val: u8,
         kind: AccessType,
@@ -1504,7 +2616,7 @@ impl Hart {
     #[inline]
     fn write_u16(
         &mut self,
-        bus: &mut impl Bus,
+        bus: &mut (impl Bus + ?Sized),
         addr: u64,
         val: u16,
         kind: AccessType,
@@ -1518,7 +2630,7 @@ impl Hart {
     #[inline]
     fn write_u32(
         &mut self,
-        bus: &mut impl Bus,
+        bus: &mut (impl Bus + ?Sized),
         addr: u64,
         val: u32,
         kind: AccessType,
@@ -1533,7 +2645,7 @@ impl Hart {
     #[allow(dead_code)]
     fn write_u64(
         &mut self,
-        bus: &mut impl Bus,
+        bus: &mut (impl Bus + ?Sized),
         addr: u64,
         val: u64,
         kind: AccessType,
@@ -1734,7 +2846,7 @@ impl Hart {
 
     fn exec32_decoded(
         &mut self,
-        bus: &mut impl Bus,
+        bus: &mut dyn Bus,
         sbi: &mut impl Sbi,
         instr: u32,
         d: Decoded32,
@@ -2166,13 +3278,21 @@ impl Hart {
                             }
                             F5_AMOMAX => {
                                 let old = self.read_u32(bus, addr, AccessType::Load)?;
-                                let newv = if (old as i32) > (rs2_val as i32) { old } else { rs2_val };
+                                let newv = if (old as i32) > (rs2_val as i32) {
+                                    old
+                                } else {
+                                    rs2_val
+                                };
                                 self.write_u32(bus, addr, newv, AccessType::Store)?;
                                 self.regs[rd] = (old as i32) as i64 as u64;
                             }
                             F5_AMOMIN => {
                                 let old = self.read_u32(bus, addr, AccessType::Load)?;
-                                let newv = if (old as i32) < (rs2_val as i32) { old } else { rs2_val };
+                                let newv = if (old as i32) < (rs2_val as i32) {
+                                    old
+                                } else {
+                                    rs2_val
+                                };
                                 self.write_u32(bus, addr, newv, AccessType::Store)?;
                                 self.regs[rd] = (old as i32) as i64 as u64;
                             }
@@ -2240,13 +3360,21 @@ impl Hart {
                             }
                             F5_AMOMAX => {
                                 let old = self.read_u64(bus, addr, AccessType::Load)?;
-                                let newv = if (old as i64) > (rs2_val as i64) { old } else { rs2_val };
+                                let newv = if (old as i64) > (rs2_val as i64) {
+                                    old
+                                } else {
+                                    rs2_val
+                                };
                                 self.write_u64(bus, addr, newv, AccessType::Store)?;
                                 self.regs[rd] = old;
                             }
                             F5_AMOMIN => {
                                 let old = self.read_u64(bus, addr, AccessType::Load)?;
-                                let newv = if (old as i64) < (rs2_val as i64) { old } else { rs2_val };
+                                let newv = if (old as i64) < (rs2_val as i64) {
+                                    old
+                                } else {
+                                    rs2_val
+                                };
                                 self.write_u64(bus, addr, newv, AccessType::Store)?;
                                 self.regs[rd] = old;
                             }

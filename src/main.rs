@@ -465,8 +465,7 @@ fn main() {
                     eprintln!("Missing value for --uart-poll-check-ticks");
                     std::process::exit(1);
                 };
-                tuning.uart_poll_check_ticks =
-                    parse_u64(&val).and_then(|v| u32::try_from(v).ok());
+                tuning.uart_poll_check_ticks = parse_u64(&val).and_then(|v| u32::try_from(v).ok());
                 if tuning.uart_poll_check_ticks.unwrap_or(0) == 0 {
                     eprintln!("Invalid --uart-poll-check-ticks value: {val}");
                     std::process::exit(1);
