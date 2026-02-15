@@ -24,6 +24,14 @@ struct FastTlbEntry {
     ppage: u64,
 }
 
+#[derive(Clone, Copy)]
+struct DecodeCacheEntry {
+    satp: u64,
+    pc: u64,
+    instr: u32,
+    decoded: Decoded32,
+}
+
 #[derive(Clone, Copy, Default)]
 struct Decoded32 {
     opcode: u8,
@@ -38,6 +46,7 @@ struct Decoded32 {
 }
 
 const TLB_CACHE_SIZE: usize = 2_048;
+const DECODE_CACHE_SIZE: usize = 8_192;
 const TLB_PERM_R: u8 = 1 << 0;
 const TLB_PERM_W: u8 = 1 << 1;
 const TLB_PERM_X: u8 = 1 << 2;
@@ -87,6 +96,8 @@ pub struct Hart {
     fast_tlb_fetch: Option<FastTlbEntry>,
     fast_tlb_load: Option<FastTlbEntry>,
     fast_tlb_store: Option<FastTlbEntry>,
+    jit_enabled: bool,
+    decode_cache: [Option<DecodeCacheEntry>; DECODE_CACHE_SIZE],
 }
 
 #[derive(Clone, Debug)]
@@ -191,6 +202,7 @@ impl Hart {
             .unwrap_or(4)
             .max(1);
         let time_jitter_enabled = parse_env_bool("KOR_TIME_JITTER", false);
+        let jit_enabled = parse_env_bool("KOR_JIT", true);
         let mut time_jitter_state = 0x9E37_79B9_7F4A_7C15u64 ^ ((hart_id as u64) << 32);
         if time_jitter_state == 0 {
             time_jitter_state = 1;
@@ -244,6 +256,8 @@ impl Hart {
             fast_tlb_fetch: None,
             fast_tlb_load: None,
             fast_tlb_store: None,
+            jit_enabled,
+            decode_cache: [None; DECODE_CACHE_SIZE],
         }
     }
 
@@ -335,6 +349,11 @@ impl Hart {
     }
 
     #[inline]
+    fn flush_decode_cache(&mut self) {
+        self.decode_cache.fill(None);
+    }
+
+    #[inline]
     fn tlb_index(satp: u64, vpage: u64) -> usize {
         let mixed = vpage
             ^ satp
@@ -342,6 +361,12 @@ impl Hart {
             ^ vpage.rotate_left(13)
             ^ (vpage >> 7);
         (mixed as usize) & (TLB_CACHE_SIZE - 1)
+    }
+
+    #[inline]
+    fn decode_cache_index(satp: u64, pc: u64) -> usize {
+        let _ = satp;
+        ((pc >> 2) as usize) & (DECODE_CACHE_SIZE - 1)
     }
 
     #[inline]
@@ -403,6 +428,28 @@ impl Hart {
         self.tlb[idx] = Some(TlbEntry { vpage, ppage, perms });
     }
 
+    #[inline]
+    fn decode32_cached(&mut self, pc: u64, instr: u32) -> Decoded32 {
+        if !self.jit_enabled {
+            return Self::decode32(instr);
+        }
+        let satp = self.satp_cached;
+        let idx = Self::decode_cache_index(satp, pc);
+        if let Some(entry) = self.decode_cache[idx] {
+            if entry.satp == satp && entry.pc == pc && entry.instr == instr {
+                return entry.decoded;
+            }
+        }
+        let decoded = Self::decode32(instr);
+        self.decode_cache[idx] = Some(DecodeCacheEntry {
+            satp,
+            pc,
+            instr,
+            decoded,
+        });
+        decoded
+    }
+
     pub fn reset(&mut self, pc: u64, sp: u64, gp: u64) {
         self.regs = [0; 32];
         self.fregs = [0; 32];
@@ -414,6 +461,7 @@ impl Hart {
         self.last_access = None;
         self.hotpc_counts.clear();
         self.flush_tlb();
+        self.flush_decode_cache();
         self.irq_check_countdown = self.irq_check_stride;
         self.time_div_accum = 0;
         self.satp_cached = self.csrs.read(CSR_SATP);
@@ -476,6 +524,7 @@ impl Hart {
         self.last_instrs.clear();
         self.trace_last_dumped = false;
         self.flush_tlb();
+        self.flush_decode_cache();
         self.irq_check_countdown = self.irq_check_stride;
         self.satp_cached = self.csrs.read(CSR_SATP);
         Ok(())
@@ -1774,7 +1823,7 @@ impl Hart {
             (upper << 16) | (instr16 as u32)
         };
         if !debug_hooks {
-            let d = Self::decode32(instr);
+            let d = self.decode32_cached(self.pc, instr);
             let next_pc = self.exec32_decoded(bus, sbi, instr, d)?;
             self.pc = next_pc;
             self.regs[0] = 0;
@@ -1824,7 +1873,7 @@ impl Hart {
                 *left -= 1;
             }
         }
-        let d = Self::decode32(instr);
+        let d = self.decode32_cached(self.pc, instr);
         let rd = d.rd as usize;
         let rs1 = d.rs1 as usize;
         let rs2 = d.rs2 as usize;
