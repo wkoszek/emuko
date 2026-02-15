@@ -10,6 +10,14 @@ use crate::sbi::Sbi;
 use crate::trap::Trap;
 use std::collections::HashMap;
 
+#[derive(Clone, Copy)]
+struct TlbEntry {
+    satp: u64,
+    priv_mode: PrivMode,
+    vpage: u64,
+    ppage: u64,
+}
+
 pub struct Hart {
     pub regs: [u64; 32],
     pub fregs: [u64; 32],
@@ -43,6 +51,9 @@ pub struct Hart {
     mmu_trace_addr: Option<u64>,
     mmu_trace_left: u64,
     mmu_idmap_fallback: bool,
+    tlb_fetch: Option<TlbEntry>,
+    tlb_load: Option<TlbEntry>,
+    tlb_store: Option<TlbEntry>,
 }
 
 #[derive(Clone, Debug)]
@@ -162,6 +173,9 @@ impl Hart {
             mmu_trace_addr,
             mmu_trace_left,
             mmu_idmap_fallback,
+            tlb_fetch: None,
+            tlb_load: None,
+            tlb_store: None,
         }
     }
 
@@ -244,6 +258,33 @@ impl Hart {
         }
     }
 
+    #[inline]
+    fn flush_tlb(&mut self) {
+        self.tlb_fetch = None;
+        self.tlb_load = None;
+        self.tlb_store = None;
+    }
+
+    #[inline]
+    fn tlb_slot(&self, kind: AccessType) -> Option<&Option<TlbEntry>> {
+        match kind {
+            AccessType::Fetch => Some(&self.tlb_fetch),
+            AccessType::Load => Some(&self.tlb_load),
+            AccessType::Store => Some(&self.tlb_store),
+            AccessType::Debug => None,
+        }
+    }
+
+    #[inline]
+    fn tlb_slot_mut(&mut self, kind: AccessType) -> Option<&mut Option<TlbEntry>> {
+        match kind {
+            AccessType::Fetch => Some(&mut self.tlb_fetch),
+            AccessType::Load => Some(&mut self.tlb_load),
+            AccessType::Store => Some(&mut self.tlb_store),
+            AccessType::Debug => None,
+        }
+    }
+
     pub fn reset(&mut self, pc: u64, sp: u64, gp: u64) {
         self.regs = [0; 32];
         self.fregs = [0; 32];
@@ -253,6 +294,7 @@ impl Hart {
         self.csrs.reset(self.hart_id, self.misa_ext);
         self.last_access = None;
         self.hotpc_counts.clear();
+        self.flush_tlb();
         self.regs[2] = sp;
         self.regs[3] = gp;
         self.regs[4] = 0;
@@ -301,6 +343,7 @@ impl Hart {
         self.hotpc_counts.clear();
         self.last_instrs.clear();
         self.trace_last_dumped = false;
+        self.flush_tlb();
         Ok(())
     }
 
@@ -335,6 +378,9 @@ impl Hart {
     }
 
     fn record_instr(&mut self, pc: u64, instr: u32, len: u8) {
+        if !self.trace_last {
+            return;
+        }
         const MAX: usize = 64;
         if self.last_instrs.len() >= MAX {
             self.last_instrs.remove(0);
@@ -398,6 +444,8 @@ impl Hart {
 
         let satp = self.csrs.read(CSR_SATP);
         let mode = satp >> 60;
+        let vpage = vaddr >> 12;
+        let page_offset = vaddr & 0xfff;
         let idmap_fallback =
             self.mmu_idmap_fallback && (0x8000_0000..0x1_0000_0000).contains(&vaddr);
         if mode == 0 {
@@ -413,6 +461,19 @@ impl Hart {
                 eprintln!("  unsupported satp mode {}", mode);
             }
             return Err(Trap::PageFault { addr: vaddr, kind });
+        }
+
+        if !mmu_trace {
+            if let Some(slot) = self.tlb_slot(kind) {
+                if let Some(entry) = slot {
+                    if entry.satp == satp
+                        && entry.priv_mode == self.priv_mode
+                        && entry.vpage == vpage
+                    {
+                        return Ok((entry.ppage << 12) | page_offset);
+                    }
+                }
+            }
         }
 
         let sign = (vaddr >> 38) & 1;
@@ -500,7 +561,6 @@ impl Hart {
                 }
 
                 let ppn = pte >> 10;
-                let page_offset = vaddr & 0xfff;
                 let phys = match level {
                     2 => {
                         // 1 GiB superpage: ppn1/ppn0 must be zero.
@@ -526,6 +586,17 @@ impl Hart {
                 };
                 if mmu_trace {
                     eprintln!("  -> phys=0x{:016x}", phys);
+                }
+                if !mmu_trace {
+                    let priv_mode = self.priv_mode;
+                    if let Some(slot) = self.tlb_slot_mut(kind) {
+                        *slot = Some(TlbEntry {
+                            satp,
+                            priv_mode,
+                            vpage,
+                            ppage: phys >> 12,
+                        });
+                    }
                 }
                 return Ok(phys);
             }
@@ -832,7 +903,12 @@ impl Hart {
         }
 
         self.check_align(self.pc, 2)?;
-        let instr16 = self.read_u16(bus, self.pc, AccessType::Fetch)?;
+        let (instr16, instr32_cached) = if (self.pc & 0x3) == 0 {
+            let word = self.read_u32(bus, self.pc, AccessType::Fetch)?;
+            ((word & 0xffff) as u16, Some(word))
+        } else {
+            (self.read_u16(bus, self.pc, AccessType::Fetch)?, None)
+        };
         if (instr16 & 0x3) != 0x3 {
             self.record_instr(self.pc, instr16 as u32, 2);
             let pc_before = self.pc;
@@ -949,8 +1025,12 @@ impl Hart {
             }
             return res;
         }
-        let upper = self.read_u16(bus, self.pc.wrapping_add(2), AccessType::Fetch)? as u32;
-        let instr = (upper << 16) | (instr16 as u32);
+        let instr = if let Some(word) = instr32_cached {
+            word
+        } else {
+            let upper = self.read_u16(bus, self.pc.wrapping_add(2), AccessType::Fetch)? as u32;
+            (upper << 16) | (instr16 as u32)
+        };
         self.record_instr(self.pc, instr, 4);
         let trace_window = self.trace_pc.map_or(false, |start| {
             self.pc >= start && self.pc < start.saturating_add(self.trace_span)
@@ -1337,7 +1417,10 @@ impl Hart {
                                 // No-op for now.
                             }
                             _ => {
-                                // SFENCE.VMA and other priv ops: treat as no-op for now.
+                                // SFENCE.VMA has funct7=0b0001001 and should invalidate TLB.
+                                if (instr >> 25) == 0x09 {
+                                    self.flush_tlb();
+                                }
                             }
                         }
                     }
@@ -1388,6 +1471,9 @@ impl Hart {
                         }
                         if do_write {
                             self.csrs.write(csr_addr, new_val);
+                            if csr_addr == CSR_SATP {
+                                self.flush_tlb();
+                            }
                         }
                     }
                     _ => return Err(Trap::IllegalInstruction(instr)),
