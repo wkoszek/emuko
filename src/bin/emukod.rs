@@ -224,6 +224,8 @@ struct DaemonState {
     snapshot_dir: String,
     chunk_steps: u64,
     last_error: Option<String>,
+    autosnapshot_every: u64,
+    autosnapshot_last: u64,
 }
 
 enum RegTarget {
@@ -1028,6 +1030,19 @@ fn handle_path(path: &str, st: &mut DaemonState) -> (u16, String, &'static str) 
         }
         return (200, state_json(st), "application/json");
     }
+    if path == "/v1/api/snap/stop" {
+        st.autosnapshot_every = 0;
+        return (200, "{\"every\":0}".to_string(), "application/json");
+    }
+    if let Some(n_str) = path.strip_prefix("/v1/api/snap/every/") {
+        if let Some(n) = parse_u64(n_str) {
+            st.autosnapshot_every = n;
+            st.autosnapshot_last = st.system.total_steps();
+            return (200, format!("{{\"every\":{}}}", n), "application/json");
+        } else {
+            return (400, "{\"error\":\"invalid step count\"}".to_string(), "application/json");
+        }
+    }
     if path == "/v1/api/snap" {
         let _ = fs::create_dir_all(&st.snapshot_dir);
         let out = format!(
@@ -1267,6 +1282,17 @@ fn run_loop(mut st: DaemonState, addr: &str) -> Result<(), String> {
                 }
                 Err(_) => {
                     st.running = false;
+                }
+            }
+            if st.autosnapshot_every > 0 {
+                let total = st.system.total_steps();
+                if total - st.autosnapshot_last >= st.autosnapshot_every {
+                    let _ = fs::create_dir_all(&st.snapshot_dir);
+                    let path = format!("{}/snap-{:020}.emuko.zst", st.snapshot_dir, total);
+                    if let Err(e) = st.system.save_snapshot(&path) {
+                        eprintln!("Autosnapshot failed: {}", e);
+                    }
+                    st.autosnapshot_last = total;
                 }
             }
         }
@@ -2401,6 +2427,8 @@ mount -t proc proc /proc; mount -t sysfs sysfs /sys; mount -t devtmpfs devtmpfs 
         snapshot_dir: opts.snapshot_dir.clone(),
         chunk_steps: opts.chunk_steps.max(1),
         last_error: None,
+        autosnapshot_every: 0,
+        autosnapshot_last: 0,
     };
     if let Err(e) = run_loop(st, &opts.addr) {
         eprintln!("daemon error: {}", e);

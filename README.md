@@ -21,10 +21,7 @@ Fast RISC-V emulator written in Rust. Boots Linux.
 cargo build --release
 ```
 
-Binaries are placed in `target/release/`:
-- `emuko` — CLI: download, daemon control (`start`, `stop`, `dump`, `step`, `con`, `uart`, etc.)
-- `emukod` — daemon with HTTP API + standalone emulator (debug mode)
-- `emuko-debug-jitdiff` — JIT correctness checker
+The main binary is `target/release/emuko`.
 
 ## Quick Start
 
@@ -65,36 +62,25 @@ emuko kill             # shut down daemon
 
 The daemon exposes an HTTP API at `http://127.0.0.1:7788/v1/api/` and a WebSocket console at `ws://127.0.0.1:7788/v1/ws/uart`.
 
-### Run a bare-metal binary
-
-```
-emukod program.bin --steps 10000
-```
-
 ### Snapshots
 
 ```
-# Save
-emukod <kernel> --linux --initrd <initrd> \
-  --save-snapshot state.emuko.zst --steps 5000000
-
-# Restore
-emukod <kernel> --linux --initrd <initrd> \
-  --load-snapshot state.emuko.zst
+emuko snap                 # take a snapshot now
+emuko snap 5000000         # auto-snapshot every 5M steps
+emuko snap stop            # disable auto-snapshots
+emuko ls                   # list snapshots
+emuko restore <snapshot>   # restore a snapshot
 ```
 
 ## Configuration
 
-Options can be set via CLI flags, environment variables, or `emuko.yml`:
+Pass options after `emuko start`, or set via environment variables or `emuko.yml`:
 
 | Option | Env Var | Default | Description |
 |--------|---------|---------|-------------|
 | `--ram-size` | `RAM_SIZE` | 1 GB | RAM in bytes |
-| `--steps` | `STEPS` | unlimited | Max instructions to execute |
 | `--backend` | `EMUKO_BACKEND` | `adaptive` | `adaptive`, `arm64_jit`, `amd64_jit`, `arm64`, `x86_64` |
 | `--bootargs` | `BOOTARGS` | serial console | Kernel command line |
-| `--trace-traps N` | `TRACE_TRAPS` | 0 | Print trap details |
-| `--trace-instr N` | `TRACE_INSTR` | 0 | Print executed instructions |
 
 ## Getting a Kernel
 

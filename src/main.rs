@@ -609,7 +609,20 @@ fn run_ctl(cmd: &str, args: &mut impl Iterator<Item = String>, addr: &str) {
             format!("/v1/api/restore/{}", name)
         }
         "ls" => "/v1/api/ls".to_string(),
-        "snap" => "/v1/api/snap".to_string(),
+        "snap" => {
+            if let Some(arg) = args.next() {
+                if arg == "stop" || arg == "off" {
+                    "/v1/api/snap/stop".to_string()
+                } else if parse_u64(&arg).is_some() {
+                    format!("/v1/api/snap/every/{}", arg)
+                } else {
+                    eprintln!("Usage: emuko snap [N|stop]");
+                    std::process::exit(1);
+                }
+            } else {
+                "/v1/api/snap".to_string()
+            }
+        }
         "set" => {
             let Some(reg) = args.next() else {
                 eprintln!("Usage: emuko set <register> <value>");
@@ -695,7 +708,7 @@ fn print_usage() {
     eprintln!("  dump                      Print CPU state");
     eprintln!("  step [n]                  Step N instructions (default 1)");
     eprintln!("  disas                     Disassemble at current PC");
-    eprintln!("  snap                      Take a snapshot");
+    eprintln!("  snap [N|stop]             Snapshot now / auto every N steps / stop auto");
     eprintln!("  ls                        List snapshots");
     eprintln!("  restore <snapshot>        Restore a snapshot");
     eprintln!("  set <register> <value>    Set register value");
