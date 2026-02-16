@@ -3,3 +3,4 @@ artifacts/
 riscv-isa-manual/
 riscv-privileged.pdf
 riscv-unprivileged.pdf
+.playwright-mcp/
