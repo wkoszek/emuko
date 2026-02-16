@@ -572,7 +572,10 @@ fn run_console(addr: &str) {
     if let Some(ref s) = saved {
         restore_terminal(s);
     }
-    eprintln!("\nDetached. Daemon still running at {}.", addr);
+    eprintln!();
+    eprintln!("Detached. Emulator is still running in the background.");
+    eprintln!("  emuko start   Reattach console");
+    eprintln!("  emuko kill    Shut down the emulator");
 }
 
 // ---------------------------------------------------------------------------
