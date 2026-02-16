@@ -28,34 +28,42 @@ Binaries are placed in `target/release/`:
 
 ## Quick Start
 
-### Download a kernel
+### 1. Download a kernel
 
 ```
 emuko dow
 ```
 
-This downloads the Debian RISC-V netboot kernel and initrd to `~/.emuko/riscv64/debian-netboot/` with SHA256 verification.
+Downloads the Debian RISC-V netboot kernel and initrd to `~/.emuko/` with SHA256 verification.
 
-### Boot Linux (interactive daemon)
-
-```
-./runlinux_interactive.sh --kernel <kernel> --initrd <initrd>
-```
-
-Or start the daemon directly and control it with `emuko`:
+### 2. Boot Linux
 
 ```
-emukod --kernel <kernel> --initrd <initrd> --autostart &
+emuko start ~/.emuko/riscv64/debian-netboot/linux \
+            ~/.emuko/riscv64/debian-netboot/initrd.gz --autostart
+```
+
+This starts the emulator daemon and attaches an interactive console. You'll see the kernel boot and get a shell prompt. Keyboard shortcuts:
+
+| Key | Action |
+|-----|--------|
+| Ctrl+] | Detach from console (daemon keeps running) |
+| Ctrl+C | Sent to guest (interrupt running command) |
+| Ctrl+D | Sent to guest (EOF) |
+
+### 3. Reattach or control
+
+```
+emuko start            # reattach console to running daemon
 emuko dump             # print CPU state
+emuko stop             # pause execution
 emuko con              # continue execution
-emuko stop             # pause
 emuko step 1000        # step N instructions
-emuko uart-inject "ls" # inject command into guest UART
 emuko snap             # take a snapshot
-emuko ls               # list snapshots
+emuko kill             # shut down daemon
 ```
 
-The daemon exposes an HTTP API at `http://127.0.0.1:7788/v1/api/` with endpoints: `start`, `stop`, `dump`, `step`, `continue`, `set`, `snap`, `ls`, `restore`, `uart`.
+The daemon exposes an HTTP API at `http://127.0.0.1:7788/v1/api/` and a WebSocket console at `ws://127.0.0.1:7788/v1/ws/uart`.
 
 ### Run a bare-metal binary
 

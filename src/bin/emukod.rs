@@ -47,6 +47,127 @@ use trap::Trap;
 
 const NAME: &str = "emuko";
 
+// ---------------------------------------------------------------------------
+// Minimal WebSocket (RFC 6455) — SHA-1, base64, frame encode/decode
+// ---------------------------------------------------------------------------
+
+fn sha1(data: &[u8]) -> [u8; 20] {
+    let mut h0: u32 = 0x67452301;
+    let mut h1: u32 = 0xEFCDAB89;
+    let mut h2: u32 = 0x98BADCFE;
+    let mut h3: u32 = 0x10325476;
+    let mut h4: u32 = 0xC3D2E1F0;
+    let bit_len = (data.len() as u64) * 8;
+    let mut msg = data.to_vec();
+    msg.push(0x80);
+    while (msg.len() % 64) != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bit_len.to_be_bytes());
+    for chunk in msg.chunks_exact(64) {
+        let mut w = [0u32; 80];
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes([chunk[i * 4], chunk[i * 4 + 1], chunk[i * 4 + 2], chunk[i * 4 + 3]]);
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        }
+        let (mut a, mut b, mut c, mut d, mut e) = (h0, h1, h2, h3, h4);
+        for i in 0..80 {
+            let (f, k) = match i {
+                0..=19 => ((b & c) | ((!b) & d), 0x5A827999u32),
+                20..=39 => (b ^ c ^ d, 0x6ED9EBA1u32),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDCu32),
+                _ => (b ^ c ^ d, 0xCA62C1D6u32),
+            };
+            let temp = a.rotate_left(5).wrapping_add(f).wrapping_add(e).wrapping_add(k).wrapping_add(w[i]);
+            e = d; d = c; c = b.rotate_left(30); b = a; a = temp;
+        }
+        h0 = h0.wrapping_add(a); h1 = h1.wrapping_add(b); h2 = h2.wrapping_add(c);
+        h3 = h3.wrapping_add(d); h4 = h4.wrapping_add(e);
+    }
+    let mut out = [0u8; 20];
+    out[0..4].copy_from_slice(&h0.to_be_bytes());
+    out[4..8].copy_from_slice(&h1.to_be_bytes());
+    out[8..12].copy_from_slice(&h2.to_be_bytes());
+    out[12..16].copy_from_slice(&h3.to_be_bytes());
+    out[16..20].copy_from_slice(&h4.to_be_bytes());
+    out
+}
+
+fn base64_encode(data: &[u8]) -> String {
+    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(T[((n >> 18) & 63) as usize] as char);
+        out.push(T[((n >> 12) & 63) as usize] as char);
+        if chunk.len() > 1 { out.push(T[((n >> 6) & 63) as usize] as char); } else { out.push('='); }
+        if chunk.len() > 2 { out.push(T[(n & 63) as usize] as char); } else { out.push('='); }
+    }
+    out
+}
+
+fn ws_accept_key(client_key: &str) -> String {
+    let mut input = client_key.trim().to_string();
+    input.push_str("258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    base64_encode(&sha1(input.as_bytes()))
+}
+
+fn ws_encode_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(2 + 8 + payload.len());
+    frame.push(0x80 | opcode); // FIN + opcode
+    if payload.len() < 126 {
+        frame.push(payload.len() as u8);
+    } else if payload.len() <= 65535 {
+        frame.push(126);
+        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    } else {
+        frame.push(127);
+        frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+    }
+    frame.extend_from_slice(payload);
+    frame
+}
+
+/// Returns (opcode, payload) or None on incomplete/error.
+fn ws_decode_frame(buf: &[u8]) -> Option<(u8, Vec<u8>, usize)> {
+    if buf.len() < 2 { return None; }
+    let opcode = buf[0] & 0x0F;
+    let masked = (buf[1] & 0x80) != 0;
+    let len1 = (buf[1] & 0x7F) as usize;
+    let (payload_len, mut offset) = if len1 < 126 {
+        (len1, 2)
+    } else if len1 == 126 {
+        if buf.len() < 4 { return None; }
+        (u16::from_be_bytes([buf[2], buf[3]]) as usize, 4)
+    } else {
+        if buf.len() < 10 { return None; }
+        let mut arr = [0u8; 8];
+        arr.copy_from_slice(&buf[2..10]);
+        (u64::from_be_bytes(arr) as usize, 10)
+    };
+    let mask_key = if masked {
+        if buf.len() < offset + 4 { return None; }
+        let k = [buf[offset], buf[offset + 1], buf[offset + 2], buf[offset + 3]];
+        offset += 4;
+        Some(k)
+    } else {
+        None
+    };
+    if buf.len() < offset + payload_len { return None; }
+    let mut payload = buf[offset..offset + payload_len].to_vec();
+    if let Some(k) = mask_key {
+        for (i, b) in payload.iter_mut().enumerate() {
+            *b ^= k[i % 4];
+        }
+    }
+    Some((opcode, payload, offset + payload_len))
+}
+
 #[derive(Clone, Debug)]
 struct DaemonOpts {
     snapshot: Option<String>,
@@ -98,6 +219,7 @@ struct CliOverrides {
 struct DaemonState {
     system: System,
     running: bool,
+    shutdown_requested: bool,
     boot_snapshot: String,
     snapshot_dir: String,
     chunk_steps: u64,
@@ -757,6 +879,11 @@ fn handle_path(path: &str, st: &mut DaemonState) -> (u16, String, &'static str) 
         st.running = false;
         return (200, state_json(st), "application/json");
     }
+    if path == "/v1/api/shutdown" {
+        st.running = false;
+        st.shutdown_requested = true;
+        return (200, "{\"shutdown\":true}".to_string(), "application/json");
+    }
     if path == "/v1/api/dump" || path == "/v1/api/state" {
         return (200, state_json(st), "application/json");
     }
@@ -955,26 +1082,56 @@ fn handle_path(path: &str, st: &mut DaemonState) -> (u16, String, &'static str) 
     }
 }
 
-fn handle_connection(mut stream: TcpStream, st: &mut DaemonState) {
+/// Returns Some(stream) if this was a WebSocket upgrade for UART; None for normal HTTP.
+fn handle_connection(mut stream: TcpStream, st: &mut DaemonState) -> Option<TcpStream> {
     let _ = stream.set_read_timeout(Some(Duration::from_millis(25)));
     let mut buf = [0u8; 8192];
     let n = match stream.read(&mut buf) {
-        Ok(0) => return,
+        Ok(0) => return None,
         Ok(n) => n,
-        Err(_) => return,
+        Err(_) => return None,
     };
     let req = String::from_utf8_lossy(&buf[..n]);
     let first = req.lines().next().unwrap_or_default();
     let mut parts = first.split_whitespace();
     let method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("/");
+
+    // Detect WebSocket upgrade for UART console.
+    if method == "GET" && target == "/v1/ws/uart" {
+        let mut ws_key = None;
+        for line in req.lines() {
+            let lower = line.to_ascii_lowercase();
+            if lower.starts_with("sec-websocket-key:") {
+                ws_key = Some(line.split_once(':').unwrap().1.trim().to_string());
+            }
+        }
+        if let Some(key) = ws_key {
+            let accept = ws_accept_key(&key);
+            let resp = format!(
+                "HTTP/1.1 101 Switching Protocols\r\n\
+                 Upgrade: websocket\r\n\
+                 Connection: Upgrade\r\n\
+                 Sec-WebSocket-Accept: {}\r\n\r\n",
+                accept
+            );
+            if stream.write_all(resp.as_bytes()).is_ok() {
+                let _ = stream.set_nonblocking(true);
+                return Some(stream);
+            }
+        }
+        write_http(stream, 400, "{\"error\":\"missing Sec-WebSocket-Key\"}", "application/json");
+        return None;
+    }
+
     if method != "GET" {
         write_http(stream, 400, "{\"error\":\"GET only\"}", "application/json");
-        return;
+        return None;
     }
     let path = target.split('?').next().unwrap_or("/");
     let (code, body, ctype) = handle_path(path, st);
     write_http(stream, code, &body, ctype);
+    None
 }
 
 fn spawn_stdin_reader() -> Receiver<u8> {
@@ -1036,13 +1193,67 @@ fn load_initial_state(opts: &DaemonOpts) -> Result<(System, String), String> {
     Ok((system, boot_snapshot))
 }
 
+struct WsClient {
+    stream: TcpStream,
+    read_buf: Vec<u8>,
+}
+
+fn pump_ws_uart(st: &mut DaemonState, client: &mut Option<WsClient>) {
+    let Some(ref mut ws) = client else { return; };
+
+    // Read WebSocket frames from client → inject into guest UART.
+    let mut tmp = [0u8; 4096];
+    let mut dead = false;
+    match ws.stream.read(&mut tmp) {
+        Ok(0) => dead = true,
+        Ok(n) => ws.read_buf.extend_from_slice(&tmp[..n]),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+        Err(_) => dead = true,
+    }
+    // Process complete frames.
+    while let Some((opcode, payload, consumed)) = ws_decode_frame(&ws.read_buf) {
+        ws.read_buf.drain(..consumed);
+        match opcode {
+            // 0x01 text, 0x02 binary — both carry UART input bytes.
+            1 | 2 => {
+                if let Some(uart) = st.system.bus.device_by_name_mut::<dev::Uart16550>("uart") {
+                    uart.inject_host_bytes(&payload);
+                }
+            }
+            // 0x08 close
+            8 => { dead = true; break; }
+            // 0x09 ping → reply pong
+            9 => {
+                let pong = ws_encode_frame(0x0A, &payload);
+                if ws.stream.write_all(&pong).is_err() { dead = true; break; }
+            }
+            _ => {}
+        }
+    }
+    if dead { *client = None; return; }
+
+    // Drain guest UART TX → send as WebSocket binary frames.
+    let Some(ref mut ws) = client else { return; };
+    if let Some(uart) = st.system.bus.device_by_name_mut::<dev::Uart16550>("uart") {
+        let bytes = uart.drain_tx_bytes(8192);
+        if !bytes.is_empty() {
+            let frame = ws_encode_frame(0x02, &bytes);
+            if ws.stream.write_all(&frame).is_err() || ws.stream.flush().is_err() {
+                *client = None;
+            }
+        }
+    }
+}
+
 fn run_loop(mut st: DaemonState, addr: &str) -> Result<(), String> {
     let listener = TcpListener::bind(addr).map_err(|e| e.to_string())?;
     listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+
+    let mut ws_uart: Option<WsClient> = None;
     let stdin_rx = spawn_stdin_reader();
     eprintln!(
-        "{} daemon listening on http://{} (chunk_steps={}, boot_snapshot={})",
-        NAME, addr, st.chunk_steps, st.boot_snapshot
+        "{} daemon listening on http://{} ws://{}/v1/ws/uart (chunk_steps={}, boot_snapshot={})",
+        NAME, addr, addr, st.chunk_steps, st.boot_snapshot
     );
     loop {
         pump_console_input(&mut st, &stdin_rx);
@@ -1059,20 +1270,33 @@ fn run_loop(mut st: DaemonState, addr: &str) -> Result<(), String> {
                 }
             }
         }
+
+        pump_ws_uart(&mut st, &mut ws_uart);
+
         loop {
             match listener.accept() {
-                Ok((stream, _)) => handle_connection(stream, &mut st),
+                Ok((stream, _)) => {
+                    if let Some(upgraded) = handle_connection(stream, &mut st) {
+                        // WebSocket upgrade for UART console (latest client wins).
+                        ws_uart = Some(WsClient { stream: upgraded, read_buf: Vec::new() });
+                    }
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(_) => break,
             }
         }
         pump_console_input(&mut st, &stdin_rx);
+        if st.shutdown_requested {
+            eprintln!("{} daemon shutting down", NAME);
+            break;
+        }
         if st.running {
             std::thread::yield_now();
         } else {
             std::thread::sleep(Duration::from_millis(3));
         }
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2172,6 +2396,7 @@ mount -t proc proc /proc; mount -t sysfs sysfs /sys; mount -t devtmpfs devtmpfs 
     let st = DaemonState {
         system,
         running: opts.autostart,
+        shutdown_requested: false,
         boot_snapshot,
         snapshot_dir: opts.snapshot_dir.clone(),
         chunk_steps: opts.chunk_steps.max(1),

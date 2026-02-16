@@ -4,6 +4,9 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
 
 const REGISTRY_JSON: &str = include_str!("../registry.json");
 
@@ -354,31 +357,222 @@ fn wait_for_api(addr: &str, timeout_secs: u64) -> bool {
 }
 
 fn run_start(args: &[String], addr: &str) {
-    let emukod = find_emukod();
-    let mut cmd = Command::new(&emukod);
-    cmd.args(args);
-    let child = cmd.spawn();
-    match child {
-        Ok(mut child) => {
-            eprintln!("Started emukod (pid {})", child.id());
-            if wait_for_api(addr, 30) {
-                eprintln!("emukod API ready at http://{}", addr);
-            } else {
-                eprintln!("Warning: emukod API not ready after 30s at {}", addr);
-                match child.try_wait() {
-                    Ok(Some(status)) => {
-                        eprintln!("emukod exited with {}", status);
-                        std::process::exit(1);
+    // If a daemon is already running at this address, reuse it.
+    if http_get(addr, "/v1/api/dump").is_ok() {
+        eprintln!("Reusing existing emukod at http://{}", addr);
+    } else {
+        let emukod = find_emukod();
+        let mut cmd = Command::new(&emukod);
+        cmd.args(args);
+        // Detach emukod's stdio: stdin (we own the console), stdout+stderr (UART comes via HTTP).
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+        let child = cmd.spawn();
+        match child {
+            Ok(mut child) => {
+                eprintln!("Started emukod (pid {})", child.id());
+                if wait_for_api(addr, 30) {
+                    eprintln!("emukod API ready at http://{}", addr);
+                } else {
+                    eprintln!("Warning: emukod API not ready after 30s at {}", addr);
+                    match child.try_wait() {
+                        Ok(Some(status)) => {
+                            eprintln!("emukod exited with {}", status);
+                            std::process::exit(1);
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
-        }
-        Err(e) => {
-            eprintln!("Failed to start emukod ({}): {}", emukod.display(), e);
-            std::process::exit(1);
+            Err(e) => {
+                eprintln!("Failed to start emukod ({}): {}", emukod.display(), e);
+                std::process::exit(1);
+            }
         }
     }
+
+    // Make sure emulator is running.
+    let _ = http_get(addr, "/v1/api/continue");
+
+    run_console(addr);
+}
+
+fn save_terminal() -> Option<String> {
+    Command::new("stty")
+        .args(["-g"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+}
+
+fn set_raw_terminal() {
+    let _ = Command::new("stty").args(["raw", "-echo"]).status();
+}
+
+fn restore_terminal(saved: &str) {
+    let _ = Command::new("stty").arg(saved).status();
+}
+
+// --- Minimal WebSocket client (frame encode/decode) ---
+
+fn ws_client_encode(payload: &[u8]) -> Vec<u8> {
+    // Client frames MUST be masked (RFC 6455 sec 5.1).
+    let mask: [u8; 4] = [0x12, 0x34, 0x56, 0x78]; // fixed mask is fine for local use
+    let mut frame = Vec::with_capacity(6 + payload.len());
+    frame.push(0x82); // FIN + binary
+    if payload.len() < 126 {
+        frame.push(0x80 | payload.len() as u8); // masked + len
+    } else if payload.len() <= 65535 {
+        frame.push(0x80 | 126);
+        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    } else {
+        frame.push(0x80 | 127);
+        frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+    }
+    frame.extend_from_slice(&mask);
+    for (i, b) in payload.iter().enumerate() {
+        frame.push(b ^ mask[i % 4]);
+    }
+    frame
+}
+
+fn ws_client_decode(buf: &[u8]) -> Option<(Vec<u8>, usize)> {
+    if buf.len() < 2 { return None; }
+    let opcode = buf[0] & 0x0F;
+    let len1 = (buf[1] & 0x7F) as usize;
+    let (payload_len, offset) = if len1 < 126 {
+        (len1, 2)
+    } else if len1 == 126 {
+        if buf.len() < 4 { return None; }
+        (u16::from_be_bytes([buf[2], buf[3]]) as usize, 4)
+    } else {
+        if buf.len() < 10 { return None; }
+        let mut arr = [0u8; 8];
+        arr.copy_from_slice(&buf[2..10]);
+        (u64::from_be_bytes(arr) as usize, 10)
+    };
+    if buf.len() < offset + payload_len { return None; }
+    // Server frames are unmasked.
+    let payload = buf[offset..offset + payload_len].to_vec();
+    // Treat close frame as disconnect.
+    if opcode == 8 { return Some((Vec::new(), offset + payload_len)); }
+    Some((payload, offset + payload_len))
+}
+
+fn ws_handshake(stream: &mut TcpStream, addr: &str) -> Result<(), String> {
+    let req = format!(
+        "GET /v1/ws/uart HTTP/1.1\r\n\
+         Host: {}\r\n\
+         Upgrade: websocket\r\n\
+         Connection: Upgrade\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+         Sec-WebSocket-Version: 13\r\n\r\n",
+        addr
+    );
+    stream.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
+    stream.flush().map_err(|e| e.to_string())?;
+    let mut buf = [0u8; 1024];
+    let n = stream.read(&mut buf).map_err(|e| e.to_string())?;
+    let resp = String::from_utf8_lossy(&buf[..n]);
+    if !resp.contains("101") {
+        return Err(format!("WebSocket handshake failed: {}", resp.lines().next().unwrap_or("")));
+    }
+    Ok(())
+}
+
+fn run_console(addr: &str) {
+    let mut socket = match TcpStream::connect(addr) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Cannot connect to emukod at {}: {}", addr, e);
+            return;
+        }
+    };
+    if let Err(e) = ws_handshake(&mut socket, addr) {
+        eprintln!("WebSocket error: {}", e);
+        return;
+    }
+    let _ = socket.set_read_timeout(Some(std::time::Duration::from_millis(100)));
+
+    let saved = save_terminal();
+    eprintln!("Connected to emukod at {}", addr);
+    eprintln!("  Ctrl+]      Detach (daemon keeps running)");
+    eprintln!("  emuko start Reattach later");
+    eprintln!("  emuko kill  Shut down daemon");
+    eprintln!();
+    set_raw_terminal();
+
+    let quit = Arc::new(AtomicBool::new(false));
+
+    // Stdin thread: read bytes, send as WebSocket binary frames.
+    let quit_tx = quit.clone();
+    let mut sock_tx = socket.try_clone().expect("socket clone");
+    thread::spawn(move || {
+        let stdin = std::io::stdin();
+        let mut locked = stdin.lock();
+        let mut buf = [0u8; 256];
+        loop {
+            if quit_tx.load(Ordering::Relaxed) { break; }
+            match locked.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if buf[..n].contains(&0x1d) {
+                        // Send close frame, then quit.
+                        let _ = sock_tx.write_all(&ws_client_encode(&[]));
+                        quit_tx.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                    let frame = ws_client_encode(&buf[..n]);
+                    if sock_tx.write_all(&frame).is_err() {
+                        quit_tx.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+    });
+
+    // Main thread: read WebSocket frames, print payload to stdout.
+    let mut stdout = std::io::stdout();
+    let mut read_buf = Vec::new();
+    let mut tmp = [0u8; 8192];
+    while !quit.load(Ordering::Relaxed) {
+        match socket.read(&mut tmp) {
+            Ok(0) => {
+                let _ = stdout.write_all(b"\r\nemukod disconnected.\r\n");
+                let _ = stdout.flush();
+                break;
+            }
+            Ok(n) => read_buf.extend_from_slice(&tmp[..n]),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                // No data yet, loop around.
+            }
+            Err(_) => {
+                let _ = stdout.write_all(b"\r\nemukod disconnected.\r\n");
+                let _ = stdout.flush();
+                break;
+            }
+        }
+        // Decode all complete frames.
+        while let Some((payload, consumed)) = ws_client_decode(&read_buf) {
+            read_buf.drain(..consumed);
+            if payload.is_empty() { continue; } // close or empty
+            let _ = stdout.write_all(&payload);
+            let _ = stdout.flush();
+        }
+    }
+
+    if let Some(ref s) = saved {
+        restore_terminal(s);
+    }
+    eprintln!("\nDetached. Daemon still running at {}.", addr);
 }
 
 // ---------------------------------------------------------------------------
@@ -389,6 +583,7 @@ fn run_ctl(cmd: &str, args: &mut impl Iterator<Item = String>, addr: &str) {
     let mut raw_output = false;
     let path = match cmd {
         "stop" => "/v1/api/stop".to_string(),
+        "kill" | "shutdown" => "/v1/api/shutdown".to_string(),
         "con" | "continue" => "/v1/api/continue".to_string(),
         "dump" => "/v1/api/dump".to_string(),
         "disas" => "/v1/api/disas".to_string(),
@@ -490,8 +685,9 @@ fn print_usage() {
     eprintln!();
     eprintln!("Commands:");
     eprintln!("  dow [set-name]            Download kernel/initrd from registry");
-    eprintln!("  start [emukod-args...]    Start emukod daemon");
+    eprintln!("  start [emukod-args...]    Start daemon + attach console (Ctrl+] to detach)");
     eprintln!("  stop                      Stop (pause) the emulator");
+    eprintln!("  kill                      Shut down the daemon");
     eprintln!("  con                       Continue execution");
     eprintln!("  dump                      Print CPU state");
     eprintln!("  step [n]                  Step N instructions (default 1)");
