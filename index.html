@@ -1,0 +1,816 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>emuko — Fast RISC-V Emulator</title>
+<meta name="description" content="Fast RISC-V emulator written in Rust. JIT compilation for ARM64 and x86_64. Boots Linux.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+*, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+:root {
+  --bg: #06070a;
+  --surface: #0d0f14;
+  --surface-2: #141720;
+  --border: #1e222e;
+  --accent: #00f0a0;
+  --accent-dim: #00f0a020;
+  --accent-mid: #00f0a040;
+  --cyan: #00c8ff;
+  --text: #d8dce8;
+  --text-muted: #5a6080;
+  --text-dim: #3a3f55;
+  --font-display: 'JetBrains Mono', monospace;
+  --font-body: 'IBM Plex Sans', sans-serif;
+  --font-mono: 'JetBrains Mono', monospace;
+}
+
+html { scroll-behavior: smooth; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-body);
+  line-height: 1.6;
+  overflow-x: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Grid background */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  background-image:
+    linear-gradient(var(--border) 1px, transparent 1px),
+    linear-gradient(90deg, var(--border) 1px, transparent 1px);
+  background-size: 80px 80px;
+  opacity: 0.15;
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* Glow orb */
+.glow-orb {
+  position: fixed;
+  width: 600px;
+  height: 600px;
+  border-radius: 50%;
+  background: radial-gradient(circle, var(--accent-dim) 0%, transparent 70%);
+  top: -200px;
+  right: -100px;
+  pointer-events: none;
+  z-index: 0;
+}
+
+.glow-orb-2 {
+  position: fixed;
+  width: 400px;
+  height: 400px;
+  border-radius: 50%;
+  background: radial-gradient(circle, #00c8ff10 0%, transparent 70%);
+  bottom: 10%;
+  left: -100px;
+  pointer-events: none;
+  z-index: 0;
+}
+
+section, header, footer { position: relative; z-index: 1; }
+
+/* Container */
+.container {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding: 0 24px;
+}
+
+/* Nav */
+nav {
+  padding: 20px 0;
+  border-bottom: 1px solid var(--border);
+  backdrop-filter: blur(12px);
+  background: #06070a90;
+  position: sticky;
+  top: 0;
+  z-index: 100;
+}
+
+nav .container {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.logo {
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 1.25rem;
+  color: var(--text);
+  text-decoration: none;
+  letter-spacing: -0.02em;
+}
+
+.logo span { color: var(--accent); }
+
+nav ul {
+  display: flex;
+  list-style: none;
+  gap: 32px;
+  align-items: center;
+}
+
+nav a {
+  color: var(--text-muted);
+  text-decoration: none;
+  font-size: 0.875rem;
+  font-weight: 500;
+  transition: color 0.2s;
+}
+
+nav a:hover { color: var(--text); }
+
+.btn-nav {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 20px;
+  background: var(--accent);
+  color: var(--bg);
+  border-radius: 6px;
+  font-weight: 600;
+  font-size: 0.875rem;
+  text-decoration: none;
+  transition: all 0.2s;
+}
+
+.btn-nav:hover {
+  background: #00ffa8;
+  color: var(--bg);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 20px var(--accent-dim);
+}
+
+/* Hero */
+.hero {
+  padding: 120px 0 100px;
+  text-align: center;
+}
+
+.hero-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 16px;
+  border: 1px solid var(--border);
+  border-radius: 100px;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  margin-bottom: 32px;
+  background: var(--surface);
+  animation: fadeUp 0.6s ease both;
+}
+
+.hero-badge .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: pulse 2s ease infinite;
+}
+
+h1 {
+  font-family: var(--font-display);
+  font-size: clamp(3rem, 7vw, 5rem);
+  font-weight: 700;
+  letter-spacing: -0.04em;
+  line-height: 1.05;
+  margin-bottom: 24px;
+  animation: fadeUp 0.6s ease 0.1s both;
+}
+
+h1 .accent { color: var(--accent); }
+
+.hero-sub {
+  font-size: 1.2rem;
+  color: var(--text-muted);
+  max-width: 520px;
+  margin: 0 auto 48px;
+  line-height: 1.7;
+  animation: fadeUp 0.6s ease 0.2s both;
+}
+
+.hero-actions {
+  display: flex;
+  gap: 16px;
+  justify-content: center;
+  flex-wrap: wrap;
+  animation: fadeUp 0.6s ease 0.3s both;
+}
+
+.btn-primary {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 32px;
+  background: var(--accent);
+  color: var(--bg);
+  border-radius: 8px;
+  font-weight: 600;
+  font-size: 1rem;
+  text-decoration: none;
+  transition: all 0.25s;
+  font-family: var(--font-body);
+}
+
+.btn-primary:hover {
+  background: #00ffa8;
+  transform: translateY(-2px);
+  box-shadow: 0 8px 30px var(--accent-mid);
+}
+
+.btn-secondary {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 32px;
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-weight: 500;
+  font-size: 1rem;
+  text-decoration: none;
+  transition: all 0.25s;
+  font-family: var(--font-body);
+}
+
+.btn-secondary:hover {
+  border-color: var(--text-muted);
+  transform: translateY(-2px);
+}
+
+/* Terminal hero */
+.hero-terminal {
+  max-width: 700px;
+  margin: 64px auto 0;
+  animation: fadeUp 0.6s ease 0.4s both;
+}
+
+.terminal {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+  text-align: left;
+  box-shadow: 0 20px 60px #00000060, 0 0 40px var(--accent-dim);
+}
+
+.terminal-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-2);
+}
+
+.terminal-dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+}
+
+.terminal-dot:nth-child(1) { background: #ff5f57; }
+.terminal-dot:nth-child(2) { background: #febc2e; }
+.terminal-dot:nth-child(3) { background: #28c840; }
+
+.terminal-title {
+  flex: 1;
+  text-align: center;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--text-dim);
+}
+
+.terminal-body {
+  padding: 20px 24px;
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  line-height: 1.8;
+  overflow-x: auto;
+}
+
+.terminal-body .prompt { color: var(--accent); }
+.terminal-body .cmd { color: var(--text); }
+.terminal-body .output { color: var(--text-muted); }
+.terminal-body .flag { color: var(--cyan); }
+.terminal-body .comment { color: var(--text-dim); }
+
+/* Stats bar */
+.stats {
+  padding: 60px 0;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+
+.stats .container {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 32px;
+  text-align: center;
+}
+
+.stat-value {
+  font-family: var(--font-display);
+  font-size: 2rem;
+  font-weight: 700;
+  color: var(--accent);
+  margin-bottom: 4px;
+}
+
+.stat-label {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+
+/* Features */
+.features {
+  padding: 100px 0;
+}
+
+.section-label {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.15em;
+  color: var(--accent);
+  margin-bottom: 16px;
+}
+
+.section-title {
+  font-family: var(--font-display);
+  font-size: clamp(1.75rem, 4vw, 2.5rem);
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  margin-bottom: 60px;
+  max-width: 600px;
+}
+
+.features-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 20px;
+}
+
+.feature-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 32px 28px;
+  transition: all 0.3s;
+}
+
+.feature-card:hover {
+  border-color: var(--accent-mid);
+  transform: translateY(-4px);
+  box-shadow: 0 12px 40px #00000040;
+}
+
+.feature-icon {
+  width: 40px;
+  height: 40px;
+  border-radius: 8px;
+  background: var(--accent-dim);
+  border: 1px solid var(--accent-mid);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 20px;
+  font-size: 1.1rem;
+}
+
+.feature-card h3 {
+  font-family: var(--font-display);
+  font-size: 1rem;
+  font-weight: 600;
+  margin-bottom: 10px;
+  letter-spacing: -0.01em;
+}
+
+.feature-card p {
+  color: var(--text-muted);
+  font-size: 0.9rem;
+  line-height: 1.6;
+}
+
+/* Code section */
+.quickstart {
+  padding: 100px 0;
+  border-top: 1px solid var(--border);
+}
+
+.quickstart-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 60px;
+  align-items: center;
+}
+
+.quickstart-text { max-width: 420px; }
+
+.quickstart-text p {
+  color: var(--text-muted);
+  font-size: 1rem;
+  line-height: 1.7;
+  margin-bottom: 32px;
+}
+
+.quickstart-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  margin-bottom: 32px;
+}
+
+.step {
+  display: flex;
+  gap: 14px;
+  align-items: flex-start;
+}
+
+.step-num {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  font-weight: 700;
+  color: var(--accent);
+  background: var(--accent-dim);
+  border: 1px solid var(--accent-mid);
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.step-text {
+  font-size: 0.9rem;
+  color: var(--text);
+}
+
+.step-text code {
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  padding: 2px 8px;
+  border-radius: 4px;
+}
+
+/* CTA */
+.cta {
+  padding: 100px 0;
+  text-align: center;
+  border-top: 1px solid var(--border);
+}
+
+.cta-box {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 72px 48px;
+  position: relative;
+  overflow: hidden;
+}
+
+.cta-box::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 300px;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--accent), transparent);
+}
+
+.cta h2 {
+  font-family: var(--font-display);
+  font-size: clamp(1.75rem, 4vw, 2.5rem);
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  margin-bottom: 16px;
+}
+
+.cta p {
+  color: var(--text-muted);
+  font-size: 1.05rem;
+  margin-bottom: 36px;
+  max-width: 480px;
+  margin-left: auto;
+  margin-right: auto;
+}
+
+.cta-actions {
+  display: flex;
+  gap: 16px;
+  justify-content: center;
+  flex-wrap: wrap;
+}
+
+/* Footer */
+footer {
+  padding: 40px 0;
+  border-top: 1px solid var(--border);
+}
+
+footer .container {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+footer p {
+  color: var(--text-dim);
+  font-size: 0.8rem;
+}
+
+footer a {
+  color: var(--text-muted);
+  text-decoration: none;
+  font-size: 0.8rem;
+  transition: color 0.2s;
+}
+
+footer a:hover { color: var(--accent); }
+
+/* Animations */
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(20px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+.fade-in {
+  opacity: 0;
+  transform: translateY(24px);
+  transition: opacity 0.6s ease, transform 0.6s ease;
+}
+
+.fade-in.visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+/* Responsive */
+@media (max-width: 768px) {
+  .stats .container { grid-template-columns: repeat(2, 1fr); gap: 24px; }
+  .features-grid { grid-template-columns: 1fr; }
+  .quickstart-grid { grid-template-columns: 1fr; gap: 40px; }
+  nav ul { gap: 16px; }
+  .hero { padding: 80px 0 60px; }
+  .hero-terminal { margin-top: 48px; }
+  .terminal-body { font-size: 0.75rem; padding: 16px; }
+}
+
+@media (max-width: 480px) {
+  nav ul .nav-link { display: none; }
+  .stats .container { grid-template-columns: 1fr 1fr; }
+}
+
+/* Typing cursor */
+.cursor {
+  display: inline-block;
+  width: 8px;
+  height: 1.1em;
+  background: var(--accent);
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  animation: blink 1s step-end infinite;
+}
+
+@keyframes blink {
+  50% { opacity: 0; }
+}
+
+/* SVG icons inline */
+.icon-svg { width: 20px; height: 20px; }
+</style>
+</head>
+<body>
+
+<div class="glow-orb"></div>
+<div class="glow-orb-2"></div>
+
+<nav>
+  <div class="container">
+    <a href="#" class="logo">emuko<span>.</span></a>
+    <ul>
+      <li><a href="#features" class="nav-link">Features</a></li>
+      <li><a href="#quickstart" class="nav-link">Quick Start</a></li>
+      <li>
+        <a href="https://github.com/wkoszek/emuko" class="btn-nav">
+          <svg class="icon-svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>
+          GitHub
+        </a>
+      </li>
+    </ul>
+  </div>
+</nav>
+
+<section class="hero">
+  <div class="container">
+    <div class="hero-badge">
+      <span class="dot"></span>
+      v0.1.0 — Apache 2.0
+    </div>
+    <h1>RISC-V emulation<br>at <span class="accent">near native speed</span></h1>
+    <p class="hero-sub">A fast RISC-V emulator written in pure Rust with JIT compilation. Boots full Linux on your Mac or PC.</p>
+    <div class="hero-actions">
+      <a href="https://github.com/wkoszek/emuko" class="btn-primary">
+        <svg class="icon-svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>
+        View on GitHub
+      </a>
+      <a href="#quickstart" class="btn-secondary">Quick Start</a>
+    </div>
+
+    <div class="hero-terminal">
+      <div class="terminal">
+        <div class="terminal-bar">
+          <span class="terminal-dot"></span>
+          <span class="terminal-dot"></span>
+          <span class="terminal-dot"></span>
+          <span class="terminal-title">emuko</span>
+        </div>
+        <div class="terminal-body">
+          <div><span class="prompt">$</span> <span class="cmd">emuko dow</span></div>
+          <div><span class="prompt">$</span> <span class="cmd">emuko start</span></div>
+          <div><span class="output">[    0.000000] Linux version 6.12 (riscv64)</span></div>
+          <div><span class="output">[    0.000000] Machine model: riscv-virtio,qemu</span></div>
+          <div><span class="output">[    1.234567] Run /sbin/init as init process</span></div>
+          <div><span class="output">BusyBox v1.36.1 built-in shell (ash)</span></div>
+          <div><span class="prompt">~ #</span> <span class="cmd">uname -a</span><span class="cursor"></span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="stats">
+  <div class="container">
+    <div>
+      <div class="stat-value">RV64</div>
+      <div class="stat-label">IMAFDC instruction set</div>
+    </div>
+    <div>
+      <div class="stat-value">2</div>
+      <div class="stat-label">JIT backends (ARM64 + x86_64)</div>
+    </div>
+    <div>
+      <div class="stat-value">1</div>
+      <div class="stat-label">External dependency</div>
+    </div>
+    <div>
+      <div class="stat-value">~15K</div>
+      <div class="stat-label">Lines of pure Rust</div>
+    </div>
+  </div>
+</section>
+
+<section class="features" id="features">
+  <div class="container">
+    <div class="section-label fade-in">Capabilities</div>
+    <h2 class="section-title fade-in">Everything you need to run RISC-V software</h2>
+    <div class="features-grid">
+      <div class="feature-card fade-in">
+        <div class="feature-icon">&#x26A1;</div>
+        <h3>Adaptive JIT</h3>
+        <p>Native code generation for ARM64 and x86_64. Hot paths compile automatically. Interpreter fallback for full correctness.</p>
+      </div>
+      <div class="feature-card fade-in">
+        <div class="feature-icon">&#x1F427;</div>
+        <h3>Boots Linux</h3>
+        <p>Full system emulation with multiuser Linux, BusyBox shell, and interactive console. Not a toy — a real machine.</p>
+      </div>
+      <div class="feature-card fade-in">
+        <div class="feature-icon">&#x1F4BE;</div>
+        <h3>Snapshot / Restore</h3>
+        <p>Save entire machine state to disk with Zstd compression. Restore instantly. Time-travel debugging for free.</p>
+      </div>
+      <div class="feature-card fade-in">
+        <div class="feature-icon">&#x1F310;</div>
+        <h3>Daemon + HTTP API</h3>
+        <p>Run as a background service with a REST API. Step, pause, inspect, and inject UART commands remotely.</p>
+      </div>
+      <div class="feature-card fade-in">
+        <div class="feature-icon">&#x2705;</div>
+        <h3>Differential Checker</h3>
+        <p>Validate JIT output against the interpreter instruction-by-instruction. Correctness you can prove.</p>
+      </div>
+      <div class="feature-card fade-in">
+        <div class="feature-icon">&#x1F9F1;</div>
+        <h3>Full Peripheral Stack</h3>
+        <p>UART 16550, CLINT, PLIC, SBI 1.0, Sv39 MMU, and dynamic FDT generation. Everything Linux expects.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="quickstart" id="quickstart">
+  <div class="container">
+    <div class="quickstart-grid">
+      <div class="quickstart-text fade-in">
+        <div class="section-label">Quick Start</div>
+        <h2 class="section-title">Two commands to boot Linux</h2>
+        <div class="quickstart-steps">
+          <div class="step">
+            <span class="step-num">1</span>
+            <span class="step-text"><code>emuko dow</code> &mdash; download a Debian RISC-V kernel</span>
+          </div>
+          <div class="step">
+            <span class="step-num">2</span>
+            <span class="step-text"><code>emuko start</code> &mdash; boot Linux and get a shell</span>
+          </div>
+        </div>
+        <a href="https://github.com/wkoszek/emuko#quick-start" class="btn-primary">Read the Docs</a>
+      </div>
+      <div class="fade-in">
+        <div class="terminal">
+          <div class="terminal-bar">
+            <span class="terminal-dot"></span>
+            <span class="terminal-dot"></span>
+            <span class="terminal-dot"></span>
+            <span class="terminal-title">interactive console</span>
+          </div>
+          <div class="terminal-body">
+            <div><span class="prompt">$</span> <span class="cmd">emuko dow</span></div>
+            <div><span class="output">[debian-netboot] -> ~/.emuko/riscv64/debian-netboot</span></div>
+            <div><span class="output">  linux OK (sha256 verified)</span></div>
+            <div><span class="output">  initrd.gz OK (sha256 verified)</span></div>
+            <div style="height: 8px"></div>
+            <div><span class="prompt">$</span> <span class="cmd">emuko start</span></div>
+            <div><span class="output">Connected to emukod at 127.0.0.1:7788</span></div>
+            <div><span class="output">  Ctrl+]      Detach (daemon keeps running)</span></div>
+            <div><span class="output">  emuko start Reattach later</span></div>
+            <div><span class="output">  emuko kill  Shut down daemon</span></div>
+            <div style="height: 4px"></div>
+            <div><span class="output">[    0.000000] Linux version 6.12 (riscv64)</span></div>
+            <div><span class="output">[    0.000000] Machine model: riscv-virtio,qemu</span></div>
+            <div><span class="output">[    0.000000] SBI specification v0.2 detected</span></div>
+            <div><span class="output">...</span></div>
+            <div><span class="output">~ #</span> <span class="cmd">_</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="cta">
+  <div class="container">
+    <div class="cta-box fade-in">
+      <h2>Start emulating</h2>
+      <p>Open source under Apache 2.0. One dependency. Pure Rust. Works on macOS and Linux.</p>
+      <div class="cta-actions">
+        <a href="https://github.com/wkoszek/emuko" class="btn-primary">
+          <svg class="icon-svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>
+          Get emuko on GitHub
+        </a>
+        <a href="#quickstart" class="btn-secondary">See Quick Start</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="container">
+    <p>emuko &copy; 2025 Wojciech Adam Koszek. Apache 2.0.</p>
+    <a href="https://emuko.dev">emuko.dev</a>
+  </div>
+</footer>
+
+<script>
+const observer = new IntersectionObserver((entries) => {
+  entries.forEach((entry, i) => {
+    if (entry.isIntersecting) {
+      setTimeout(() => entry.target.classList.add('visible'), i * 80);
+      observer.unobserve(entry.target);
+    }
+  });
+}, { threshold: 0.15 });
+
+document.querySelectorAll('.fade-in').forEach(el => observer.observe(el));
+</script>
+
+</body>
+</html>
