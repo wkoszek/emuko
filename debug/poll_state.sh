@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-EMU_BIN="${EMU_BIN:-target/release/emu}"
+EMU_BIN="${EMU_BIN:-target/release/emuko}"
 EMUKO_ADDR="${EMUKO_ADDR:-127.0.0.1:7788}"
 COUNT="${COUNT:-200}"
 SLEEP_SECS="${SLEEP_SECS:-0.2}"

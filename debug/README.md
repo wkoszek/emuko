@@ -1,6 +1,6 @@
 # emuko Debug Scripts
 
-These scripts are for repeatable `emu`/`emukod` probing.
+These scripts are for repeatable `emuko`/`emukod` probing.
 
 ## Prerequisites
 
