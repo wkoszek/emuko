@@ -57,6 +57,10 @@ pub fn disas32(instr: u32) -> String {
         OPCODE_AUIPC => "auipc",
         OPCODE_JAL => "jal",
         OPCODE_JALR => "jalr",
+        OPCODE_MADD => "fmadd",
+        OPCODE_MSUB => "fmsub",
+        OPCODE_NMSUB => "fnmsub",
+        OPCODE_NMADD => "fnmadd",
         OPCODE_BRANCH => match funct3 {
             F3_BEQ => "beq",
             F3_BNE => "bne",
@@ -200,7 +204,7 @@ pub fn disas32(instr: u32) -> String {
             };
             return format!("{base}{suf}");
         }
-        0b1010011 => "op-fp",
+        OPCODE_OP_FP => "op-fp",
         _ => "unknown",
     };
     name.to_string()

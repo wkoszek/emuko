@@ -18,6 +18,8 @@ mod decode;
 mod exec_core;
 #[path = "hart/jit_a64.rs"]
 mod jit_a64;
+#[path = "hart/jit_x64.rs"]
+mod jit_x64;
 #[path = "hart/memory.rs"]
 mod memory;
 #[path = "hart/state.rs"]
@@ -75,20 +77,23 @@ struct NativeBlockResult {
     executed: u64,
 }
 
+const NATIVE_EXEC_FLAG_LAST_TRAP: u64 = 1u64 << 63;
+
 #[derive(Clone, Copy)]
 struct NativeBlock {
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     offset: usize,
     instrs: u32,
 }
 
+#[cfg(target_arch = "aarch64")]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EmitFlow {
     Continue,
     Terminate,
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 type NativeBlockFn = unsafe extern "C" fn(
     *mut u64,
     *mut Hart,
@@ -98,7 +103,7 @@ type NativeBlockFn = unsafe extern "C" fn(
     *mut (),
 ) -> NativeBlockResult;
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 struct NativeCodeCache {
     ptr: *mut u8,
     size: usize,
@@ -107,7 +112,7 @@ struct NativeCodeCache {
     use_map_jit: bool,
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 impl NativeCodeCache {
     fn new(size: usize) -> Option<Self> {
         use std::ffi::c_void;
@@ -146,7 +151,19 @@ impl NativeCodeCache {
 
         #[cfg(target_os = "macos")]
         let mut use_map_jit = true;
+        #[cfg(target_os = "macos")]
         let mut p = unsafe {
+            mmap(
+                std::ptr::null_mut(),
+                size,
+                PROT_READ | PROT_WRITE | PROT_EXEC,
+                flags,
+                -1,
+                0,
+            )
+        };
+        #[cfg(not(target_os = "macos"))]
+        let p = unsafe {
             mmap(
                 std::ptr::null_mut(),
                 size,
@@ -247,7 +264,7 @@ impl NativeCodeCache {
     }
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 impl Drop for NativeCodeCache {
     fn drop(&mut self) {
         use std::ffi::c_void;
@@ -261,15 +278,17 @@ impl Drop for NativeCodeCache {
 struct NativeJit {
     enabled: bool,
     blocks: HashMap<(u64, u64), NativeBlock>,
+    #[cfg(target_arch = "x86_64")]
+    links: HashMap<(u64, usize, u64), NativeBlock>,
     failed: HashSet<(u64, u64)>,
     hot: HashMap<(u64, u64), u16>,
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     cache: Option<NativeCodeCache>,
 }
 
 impl NativeJit {
     fn new(enabled: bool, code_size: usize) -> Self {
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
         {
             let cache = if enabled {
                 NativeCodeCache::new(code_size)
@@ -283,17 +302,21 @@ impl NativeJit {
             Self {
                 enabled: enabled && ready,
                 blocks: HashMap::new(),
+                #[cfg(target_arch = "x86_64")]
+                links: HashMap::new(),
                 failed: HashSet::new(),
                 hot: HashMap::new(),
                 cache,
             }
         }
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
         {
-            let _ = code_size;
+            let _ = (enabled, code_size);
             Self {
                 enabled: false,
                 blocks: HashMap::new(),
+                #[cfg(target_arch = "x86_64")]
+                links: HashMap::new(),
                 failed: HashSet::new(),
                 hot: HashMap::new(),
             }
@@ -302,9 +325,11 @@ impl NativeJit {
 
     fn clear(&mut self) {
         self.blocks.clear();
+        #[cfg(target_arch = "x86_64")]
+        self.links.clear();
         self.failed.clear();
         self.hot.clear();
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
         if let Some(cache) = self.cache.as_mut() {
             cache.clear();
         }
@@ -318,6 +343,16 @@ impl NativeJit {
         self.failed.remove(&(satp, pc));
         self.hot.remove(&(satp, pc));
         self.blocks.insert((satp, pc), block);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn lookup_link(&self, satp: u64, from_off: usize, next_pc: u64) -> Option<NativeBlock> {
+        self.links.get(&(satp, from_off, next_pc)).copied()
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn insert_link(&mut self, satp: u64, from_off: usize, next_pc: u64, block: NativeBlock) {
+        self.links.insert((satp, from_off, next_pc), block);
     }
 
     fn is_failed(&self, satp: u64, pc: u64) -> bool {
@@ -566,6 +601,7 @@ pub struct HartSnapshot {
     pub time_jitter_state: u64,
 }
 
+#[cfg(target_arch = "aarch64")]
 impl Hart {
     const MEM_OP_LB: u64 = 0;
     const MEM_OP_LH: u64 = 1;
@@ -578,7 +614,9 @@ impl Hart {
     const MEM_OP_SH: u64 = 17;
     const MEM_OP_SW: u64 = 18;
     const MEM_OP_SD: u64 = 19;
+}
 
+impl Hart {
     pub fn new(hart_id: usize, misa_ext: u64) -> Self {
         fn parse_env_u64(name: &str) -> Option<u64> {
             std::env::var(name).ok().and_then(|v| {

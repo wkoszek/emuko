@@ -56,6 +56,41 @@ struct DaemonOpts {
     snapshot_dir: String,
     chunk_steps: u64,
     autostart: bool,
+    backend: String,
+    host_arch: String,
+    jit_native: bool,
+    config_path: Option<String>,
+}
+
+#[derive(Default, Clone, Debug)]
+struct DaemonConfigFile {
+    snapshot: Option<String>,
+    kernel: Option<String>,
+    initrd: Option<String>,
+    debian_netboot_dir: Option<String>,
+    dqib_dir: Option<String>,
+    ram_size: Option<u64>,
+    bootargs: Option<String>,
+    addr: Option<String>,
+    snapshot_dir: Option<String>,
+    chunk_steps: Option<u64>,
+    autostart: Option<bool>,
+    backend: Option<String>,
+}
+
+#[derive(Default, Clone, Debug)]
+struct CliOverrides {
+    config: Option<String>,
+    snapshot: Option<String>,
+    kernel: Option<String>,
+    initrd: Option<String>,
+    ram_size: Option<u64>,
+    bootargs: Option<String>,
+    addr: Option<String>,
+    snapshot_dir: Option<String>,
+    chunk_steps: Option<u64>,
+    autostart: Option<bool>,
+    backend: Option<String>,
 }
 
 struct DaemonState {
@@ -74,7 +109,8 @@ enum RegTarget {
 
 fn print_usage_and_exit() -> ! {
     eprintln!(
-        "Usage: koriscvd [--snapshot FILE] [<kernel> <initrd>] [--ram-size BYTES] [--bootargs STR] [--addr HOST:PORT] [--snapshot-dir DIR] [--chunk-steps N] [--autostart]"
+        "Usage: koriscvd [--config FILE] [--snapshot FILE] [--kernel FILE] [--initrd FILE] [<kernel> <initrd>] [--ram-size BYTES] [--bootargs STR] [--addr HOST:PORT] [--snapshot-dir DIR] [--chunk-steps N] [--autostart] [--backend adaptive|arm64_jit|amd64_jit|arm64|x86_64]\n\
+Precedence: config file < command switch < environment variable"
     );
     std::process::exit(1);
 }
@@ -87,25 +123,126 @@ fn parse_u64(arg: &str) -> Option<u64> {
     }
 }
 
+fn parse_bool_text(arg: &str) -> Option<bool> {
+    match arg.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn clean_opt(v: Option<String>) -> Option<String> {
+    v.and_then(|s| {
+        let t = s.trim().to_string();
+        if t.is_empty() {
+            None
+        } else {
+            Some(t)
+        }
+    })
+}
+
+fn unquote_yaml(v: &str) -> String {
+    let s = v.trim();
+    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
+        s[1..s.len() - 1].replace("\\\"", "\"")
+    } else if s.len() >= 2 && s.starts_with('\'') && s.ends_with('\'') {
+        s[1..s.len() - 1].to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+fn parse_korisc_yaml(path: &Path) -> Result<DaemonConfigFile, String> {
+    let content = fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let mut cfg = DaemonConfigFile::default();
+    for raw in content.lines() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
+        let key = k.trim().to_ascii_lowercase();
+        let val = unquote_yaml(v);
+        match key.as_str() {
+            "snapshot" | "snapshot_load" => cfg.snapshot = clean_opt(Some(val)),
+            "kernel" => cfg.kernel = clean_opt(Some(val)),
+            "initrd" => cfg.initrd = clean_opt(Some(val)),
+            "debian_netboot_dir" => cfg.debian_netboot_dir = clean_opt(Some(val)),
+            "dqib_dir" => cfg.dqib_dir = clean_opt(Some(val)),
+            "ram_size" => cfg.ram_size = parse_u64(&val),
+            "bootargs" => cfg.bootargs = clean_opt(Some(val)),
+            "kor_addr" | "addr" => cfg.addr = clean_opt(Some(val)),
+            "autosnapshot_dir" | "snapshot_dir" => cfg.snapshot_dir = clean_opt(Some(val)),
+            "chunk_steps" => cfg.chunk_steps = parse_u64(&val),
+            "autostart" => cfg.autostart = parse_bool_text(&val),
+            "backend" => cfg.backend = clean_opt(Some(val)),
+            _ => {}
+        }
+    }
+    Ok(cfg)
+}
+
+fn resolve_backend(requested: &str, host_arch: &str) -> (String, bool) {
+    match requested {
+        "adaptive" => match host_arch {
+            "aarch64" => ("arm64_jit".to_string(), true),
+            "x86_64" => ("amd64_jit".to_string(), true),
+            _ => ("x86_64".to_string(), false),
+        },
+        "arm64_jit" => {
+            if host_arch == "aarch64" {
+                ("arm64_jit".to_string(), true)
+            } else {
+                ("arm64".to_string(), false)
+            }
+        }
+        "amd64_jit" => {
+            if host_arch == "x86_64" {
+                ("amd64_jit".to_string(), true)
+            } else {
+                ("x86_64".to_string(), false)
+            }
+        }
+        "arm64" => ("arm64".to_string(), false),
+        "x86_64" => ("x86_64".to_string(), false),
+        _ => resolve_backend("adaptive", host_arch),
+    }
+}
+
 fn parse_opts() -> DaemonOpts {
     let mut args = env::args().skip(1);
-    let mut snapshot = None;
-    let mut kernel = None;
-    let mut initrd = None;
-    let mut ram_size = 1024 * 1024 * 1024u64;
-    let mut bootargs =
-        "console=ttyS0,115200 earlycon=uart8250,mmio,0x10000000 rdinit=/bin/sh".to_string();
-    let mut addr = "127.0.0.1:7788".to_string();
-    let mut snapshot_dir = "/tmp/korisc5".to_string();
-    let mut chunk_steps = 4_000_000u64;
-    let mut autostart = false;
+    let mut cli = CliOverrides::default();
     let mut positionals = Vec::new();
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "-h" | "--help" => {
+                print_usage_and_exit();
+            }
+            "--config" => {
+                cli.config = args.next();
+                if cli.config.is_none() {
+                    print_usage_and_exit();
+                }
+            }
             "--snapshot" => {
-                snapshot = args.next();
-                if snapshot.is_none() {
+                cli.snapshot = args.next();
+                if cli.snapshot.is_none() {
+                    print_usage_and_exit();
+                }
+            }
+            "--kernel" => {
+                cli.kernel = args.next();
+                if cli.kernel.is_none() {
+                    print_usage_and_exit();
+                }
+            }
+            "--initrd" => {
+                cli.initrd = args.next();
+                if cli.initrd.is_none() {
                     print_usage_and_exit();
                 }
             }
@@ -113,40 +250,46 @@ fn parse_opts() -> DaemonOpts {
                 let Some(v) = args.next() else {
                     print_usage_and_exit();
                 };
-                ram_size = parse_u64(&v).unwrap_or_else(|| {
+                cli.ram_size = Some(parse_u64(&v).unwrap_or_else(|| {
                     eprintln!("Invalid --ram-size value: {v}");
                     std::process::exit(1);
-                });
+                }));
             }
             "--bootargs" => {
-                bootargs = args.next().unwrap_or_else(|| {
+                cli.bootargs = Some(args.next().unwrap_or_else(|| {
                     eprintln!("Missing --bootargs value");
                     std::process::exit(1);
-                });
+                }));
             }
             "--addr" => {
-                addr = args.next().unwrap_or_else(|| {
+                cli.addr = Some(args.next().unwrap_or_else(|| {
                     eprintln!("Missing --addr value");
                     std::process::exit(1);
-                });
+                }));
             }
             "--snapshot-dir" => {
-                snapshot_dir = args.next().unwrap_or_else(|| {
+                cli.snapshot_dir = Some(args.next().unwrap_or_else(|| {
                     eprintln!("Missing --snapshot-dir value");
                     std::process::exit(1);
-                });
+                }));
             }
             "--chunk-steps" => {
                 let Some(v) = args.next() else {
                     print_usage_and_exit();
                 };
-                chunk_steps = parse_u64(&v).unwrap_or_else(|| {
+                cli.chunk_steps = Some(parse_u64(&v).unwrap_or_else(|| {
                     eprintln!("Invalid --chunk-steps value: {v}");
                     std::process::exit(1);
-                });
+                }));
             }
             "--autostart" => {
-                autostart = true;
+                cli.autostart = Some(true);
+            }
+            "--backend" => {
+                cli.backend = args.next();
+                if cli.backend.is_none() {
+                    print_usage_and_exit();
+                }
             }
             _ if arg.starts_with("--") => {
                 eprintln!("Unknown argument: {arg}");
@@ -156,13 +299,153 @@ fn parse_opts() -> DaemonOpts {
         }
     }
 
-    if snapshot.is_none() {
-        if positionals.len() < 2 {
-            eprintln!("Need either --snapshot FILE or <kernel> <initrd>");
+    if cli.kernel.is_none() && !positionals.is_empty() {
+        cli.kernel = Some(positionals[0].clone());
+    }
+    if cli.initrd.is_none() && positionals.len() > 1 {
+        cli.initrd = Some(positionals[1].clone());
+    }
+
+    let mut cfg_path = "korisc.yml".to_string();
+    if let Some(v) = clean_opt(cli.config.clone()) {
+        cfg_path = v;
+    }
+    if let Ok(v) = env::var("KOR_CONFIG") {
+        if !v.trim().is_empty() {
+            cfg_path = v;
+        }
+    }
+    let cfg_requested = cli.config.is_some() || env::var("KOR_CONFIG").is_ok();
+    let cfg = if Path::new(&cfg_path).exists() {
+        match parse_korisc_yaml(Path::new(&cfg_path)) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                eprintln!("Failed to parse config {}: {}", cfg_path, e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        if cfg_requested {
+            eprintln!("Missing config file: {}", cfg_path);
             print_usage_and_exit();
         }
-        kernel = Some(positionals[0].clone());
-        initrd = Some(positionals[1].clone());
+        None
+    };
+
+    let cfg_kernel = cfg.as_ref().and_then(|c| c.kernel.clone());
+    let cfg_initrd = cfg.as_ref().and_then(|c| c.initrd.clone());
+    let cfg_snapshot = cfg.as_ref().and_then(|c| c.snapshot.clone());
+    let cfg_bootargs = cfg.as_ref().and_then(|c| c.bootargs.clone());
+    let cfg_addr = cfg.as_ref().and_then(|c| c.addr.clone());
+    let cfg_snapshot_dir = cfg.as_ref().and_then(|c| c.snapshot_dir.clone());
+    let cfg_backend = cfg.as_ref().and_then(|c| c.backend.clone());
+    let cfg_ram_size = cfg.as_ref().and_then(|c| c.ram_size);
+    let cfg_chunk_steps = cfg.as_ref().and_then(|c| c.chunk_steps);
+    let cfg_autostart = cfg.as_ref().and_then(|c| c.autostart);
+
+    let debian_netboot_dir = env::var("DEBIAN_NETBOOT_DIR")
+        .ok()
+        .or_else(|| cfg.as_ref().and_then(|c| c.debian_netboot_dir.clone()))
+        .unwrap_or_else(|| "artifacts/debian-netboot".to_string());
+    let dqib_dir = env::var("DQIB_DIR")
+        .ok()
+        .or_else(|| cfg.as_ref().and_then(|c| c.dqib_dir.clone()))
+        .unwrap_or_else(|| "/Users/wkoszek/Downloads/koriscv/dqib_riscv64-virt".to_string());
+
+    let mut default_kernel = format!("{}/kernel", dqib_dir);
+    let mut default_initrd = format!("{}/initrd", dqib_dir);
+    let debian_kernel = format!("{}/linux", debian_netboot_dir);
+    let debian_initrd = format!("{}/initrd.gz", debian_netboot_dir);
+    if Path::new(&debian_kernel).exists() {
+        default_kernel = debian_kernel;
+    }
+    if Path::new(&debian_initrd).exists() {
+        default_initrd = debian_initrd;
+    }
+
+    let snapshot = clean_opt(env::var("SNAPSHOT_LOAD").ok())
+        .or_else(|| clean_opt(env::var("KOR_SNAPSHOT").ok()))
+        .or_else(|| clean_opt(cli.snapshot))
+        .or_else(|| clean_opt(cfg_snapshot));
+    let kernel = clean_opt(env::var("KERNEL").ok())
+        .or_else(|| clean_opt(cli.kernel))
+        .or_else(|| clean_opt(cfg_kernel))
+        .or_else(|| Some(default_kernel));
+    let initrd = clean_opt(env::var("INITRD").ok())
+        .or_else(|| clean_opt(cli.initrd))
+        .or_else(|| clean_opt(cfg_initrd))
+        .or_else(|| Some(default_initrd));
+
+    let ram_size = env::var("RAM_SIZE")
+        .ok()
+        .and_then(|v| parse_u64(&v))
+        .or(cli.ram_size)
+        .or(cfg_ram_size)
+        .unwrap_or(1024 * 1024 * 1024u64);
+    let bootargs = clean_opt(env::var("BOOTARGS").ok())
+        .or_else(|| clean_opt(cli.bootargs))
+        .or_else(|| clean_opt(cfg_bootargs))
+        .unwrap_or_else(|| {
+            "console=ttyS0,115200 earlycon=uart8250,mmio,0x10000000 rdinit=/bin/sh".to_string()
+        });
+    let addr = clean_opt(env::var("KOR_ADDR").ok())
+        .or_else(|| clean_opt(cli.addr))
+        .or_else(|| clean_opt(cfg_addr))
+        .unwrap_or_else(|| "127.0.0.1:7788".to_string());
+    let snapshot_dir = clean_opt(env::var("AUTOSNAPSHOT_DIR").ok())
+        .or_else(|| clean_opt(cli.snapshot_dir))
+        .or_else(|| clean_opt(cfg_snapshot_dir))
+        .unwrap_or_else(|| "/tmp/korisc5".to_string());
+    let chunk_steps = env::var("CHUNK_STEPS")
+        .ok()
+        .and_then(|v| parse_u64(&v))
+        .or(cli.chunk_steps)
+        .or(cfg_chunk_steps)
+        .unwrap_or(4_000_000u64);
+    let autostart = env::var("AUTOSTART")
+        .ok()
+        .and_then(|v| parse_bool_text(&v))
+        .or(cli.autostart)
+        .or(cfg_autostart)
+        .unwrap_or(false);
+
+    let backend_requested = clean_opt(env::var("KOR_BACKEND").ok())
+        .or_else(|| clean_opt(env::var("BACKEND").ok()))
+        .or_else(|| clean_opt(cli.backend))
+        .or_else(|| clean_opt(cfg_backend))
+        .unwrap_or_else(|| "adaptive".to_string())
+        .to_ascii_lowercase();
+    let host_arch = std::env::consts::ARCH.to_string();
+    let (backend, mut jit_native) = resolve_backend(&backend_requested, &host_arch);
+    if backend_requested != backend && backend_requested != "adaptive" {
+        eprintln!(
+            "Warning: backend '{}' not compatible with host '{}'; using '{}'",
+            backend_requested, host_arch, backend
+        );
+    }
+    if let Ok(v) = env::var("KOR_JIT_NATIVE") {
+        if let Some(b) = parse_bool_text(&v) {
+            jit_native = b;
+        }
+    }
+
+    if snapshot.is_none() {
+        if kernel.is_none() || initrd.is_none() {
+            eprintln!("Need either --snapshot FILE or kernel/initrd (from args or korisc.yml)");
+            print_usage_and_exit();
+        }
+        if let Some(k) = &kernel {
+            if !Path::new(k).exists() {
+                eprintln!("Missing kernel: {}", k);
+                std::process::exit(1);
+            }
+        }
+        if let Some(i) = &initrd {
+            if !Path::new(i).exists() {
+                eprintln!("Missing initrd: {}", i);
+                std::process::exit(1);
+            }
+        }
     }
 
     DaemonOpts {
@@ -175,6 +458,14 @@ fn parse_opts() -> DaemonOpts {
         snapshot_dir,
         chunk_steps,
         autostart,
+        backend,
+        host_arch,
+        jit_native,
+        config_path: if Path::new(&cfg_path).exists() {
+            Some(cfg_path)
+        } else {
+            None
+        },
     }
 }
 
@@ -206,7 +497,7 @@ fn materialize_boot_snapshot(opts: &DaemonOpts) -> Result<String, String> {
     fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let out = dir.join("boot-initial.kriscv.zst");
 
-    let mut sim_args = vec![
+    let sim_args = vec![
         kernel.clone(),
         "--ram-size".to_string(),
         opts.ram_size.to_string(),
@@ -222,12 +513,7 @@ fn materialize_boot_snapshot(opts: &DaemonOpts) -> Result<String, String> {
         out.display().to_string(),
     ];
 
-    let status = if let Some(bin) = current_sim_bin() {
-        Command::new(bin)
-            .args(&sim_args)
-            .status()
-            .map_err(|e| format!("failed to run koriscv: {e}"))?
-    } else {
+    let run_via_cargo = |sim_args: &Vec<String>| -> Result<std::process::ExitStatus, String> {
         let mut cargo_args = vec![
             "run".to_string(),
             "--release".to_string(),
@@ -235,11 +521,28 @@ fn materialize_boot_snapshot(opts: &DaemonOpts) -> Result<String, String> {
             "koriscv".to_string(),
             "--".to_string(),
         ];
-        cargo_args.append(&mut sim_args);
+        cargo_args.extend(sim_args.iter().cloned());
         Command::new("cargo")
             .args(&cargo_args)
             .status()
-            .map_err(|e| format!("failed to run cargo: {e}"))?
+            .map_err(|e| format!("failed to run cargo: {e}"))
+    };
+
+    let status = if let Some(bin) = current_sim_bin() {
+        match Command::new(&bin).args(&sim_args).status() {
+            Ok(st) => st,
+            Err(e) if e.raw_os_error() == Some(8) => {
+                eprintln!(
+                    "warning: {} is not executable on this host ({}), falling back to cargo",
+                    bin.display(),
+                    e
+                );
+                run_via_cargo(&sim_args)?
+            }
+            Err(e) => return Err(format!("failed to run koriscv: {e}")),
+        }
+    } else {
+        run_via_cargo(&sim_args)?
     };
     if !status.success() {
         return Err("failed to build boot snapshot via koriscv".to_string());
@@ -779,6 +1082,25 @@ fn main() {
     // Daemon owns stdin-to-UART bridging; keep UART device stdin reader disabled to avoid races.
     std::env::set_var("UART_HOST_STDIN", "0");
     let opts = parse_opts();
+    if std::env::var("KOR_JIT_NATIVE").is_err() {
+        std::env::set_var("KOR_JIT_NATIVE", if opts.jit_native { "1" } else { "0" });
+    }
+    if let Some(cfg) = &opts.config_path {
+        eprintln!("config: {}", cfg);
+    }
+    eprintln!(
+        "backend: {} host_arch={} jit_native={}",
+        opts.backend,
+        opts.host_arch,
+        std::env::var("KOR_JIT_NATIVE").unwrap_or_else(|_| "0".to_string())
+    );
+    if opts.bootargs.contains("rdinit=/bin/sh") {
+        eprintln!(
+            "note: bootargs include rdinit=/bin/sh, so init scripts are skipped; \
+mount pseudo-fs in guest: \
+mount -t proc proc /proc; mount -t sysfs sysfs /sys; mount -t devtmpfs devtmpfs /dev"
+        );
+    }
     let (system, boot_snapshot) = match load_initial_state(&opts) {
         Ok(v) => v,
         Err(e) => {

@@ -1,6 +1,8 @@
 use super::*;
 
 impl Hart {
+    const F32_CANONICAL_NAN: u32 = 0x7fc0_0000;
+
     pub(super) fn has_debug_hooks(&self) -> bool {
         self.hotpc_top != 0
             || self.trace_pc_zero
@@ -9,6 +11,135 @@ impl Hart {
             || self.trace_instr.is_some()
             || self.watch_left > 0
             || self.watch_left2 > 0
+    }
+
+    #[inline]
+    fn nanbox_f32(bits: u32) -> u64 {
+        0xffff_ffff_0000_0000 | bits as u64
+    }
+
+    #[inline]
+    fn f32_bits_from_reg(bits: u64) -> u32 {
+        if (bits >> 32) != 0xffff_ffff {
+            Self::F32_CANONICAL_NAN
+        } else {
+            bits as u32
+        }
+    }
+
+    #[inline]
+    fn f32_from_reg(bits: u64) -> f32 {
+        f32::from_bits(Self::f32_bits_from_reg(bits))
+    }
+
+    #[inline]
+    fn f64_from_reg(bits: u64) -> f64 {
+        f64::from_bits(bits)
+    }
+
+    #[inline]
+    fn rm_legal(rm: u32) -> bool {
+        matches!(rm, 0..=4 | 7)
+    }
+
+    #[inline]
+    fn round_rne_even(v: f64) -> f64 {
+        let trunc = v.trunc();
+        let frac = v - trunc;
+        let abs_frac = frac.abs();
+        if abs_frac < 0.5 {
+            trunc
+        } else if abs_frac > 0.5 {
+            trunc + v.signum()
+        } else if (trunc as i64 & 1) == 0 {
+            trunc
+        } else {
+            trunc + v.signum()
+        }
+    }
+
+    #[inline]
+    fn round_fp(v: f64, rm: u32) -> f64 {
+        match rm {
+            0 | 7 => Self::round_rne_even(v),
+            1 => v.trunc(),
+            2 => v.floor(),
+            3 => v.ceil(),
+            4 => v.round(),
+            _ => Self::round_rne_even(v),
+        }
+    }
+
+    #[inline]
+    fn fcvt_f64_to_i64(v: f64, rm: u32) -> i64 {
+        if v.is_nan() {
+            return i64::MIN;
+        }
+        let r = Self::round_fp(v, rm);
+        if r >= i64::MAX as f64 {
+            i64::MAX
+        } else if r <= i64::MIN as f64 {
+            i64::MIN
+        } else {
+            r as i64
+        }
+    }
+
+    #[inline]
+    fn fcvt_f64_to_u64(v: f64, rm: u32) -> u64 {
+        if v.is_nan() {
+            return u64::MAX;
+        }
+        let r = Self::round_fp(v, rm);
+        if r <= 0.0 {
+            0
+        } else if r >= u64::MAX as f64 {
+            u64::MAX
+        } else {
+            r as u64
+        }
+    }
+
+    #[inline]
+    fn fclass_f32(bits: u32) -> u64 {
+        let sign = (bits >> 31) != 0;
+        let exp = (bits >> 23) & 0xff;
+        let frac = bits & 0x7f_ffff;
+        if exp == 0xff {
+            if frac == 0 {
+                return if sign { 1 << 0 } else { 1 << 7 };
+            }
+            let snan = (frac & 0x40_0000) == 0;
+            return if snan { 1 << 8 } else { 1 << 9 };
+        }
+        if exp == 0 {
+            if frac == 0 {
+                return if sign { 1 << 3 } else { 1 << 4 };
+            }
+            return if sign { 1 << 2 } else { 1 << 5 };
+        }
+        if sign { 1 << 1 } else { 1 << 6 }
+    }
+
+    #[inline]
+    fn fclass_f64(bits: u64) -> u64 {
+        let sign = (bits >> 63) != 0;
+        let exp = (bits >> 52) & 0x7ff;
+        let frac = bits & 0x000f_ffff_ffff_ffff;
+        if exp == 0x7ff {
+            if frac == 0 {
+                return if sign { 1 << 0 } else { 1 << 7 };
+            }
+            let snan = (frac & 0x0008_0000_0000_0000) == 0;
+            return if snan { 1 << 8 } else { 1 << 9 };
+        }
+        if exp == 0 {
+            if frac == 0 {
+                return if sign { 1 << 3 } else { 1 << 4 };
+            }
+            return if sign { 1 << 2 } else { 1 << 5 };
+        }
+        if sign { 1 << 1 } else { 1 << 6 }
     }
 
     pub(super) fn exec32_decoded(
@@ -50,6 +181,42 @@ impl Hart {
                 self.regs[rd] = next_pc;
                 next_pc = target;
             }
+            OPCODE_MADD | OPCODE_MSUB | OPCODE_NMSUB | OPCODE_NMADD => {
+                if !Self::rm_legal(funct3) {
+                    return Err(Trap::IllegalInstruction(instr));
+                }
+                let rs3 = ((instr >> 27) & 0x1f) as usize;
+                let fmt = (instr >> 25) & 0x3;
+                match fmt {
+                    0 => {
+                        let a = Self::f32_from_reg(self.fregs[rs1]);
+                        let b = Self::f32_from_reg(self.fregs[rs2]);
+                        let c = Self::f32_from_reg(self.fregs[rs3]);
+                        let out = match opcode {
+                            OPCODE_MADD => a.mul_add(b, c),
+                            OPCODE_MSUB => a.mul_add(b, -c),
+                            OPCODE_NMSUB => (-a).mul_add(b, c),
+                            OPCODE_NMADD => (-a).mul_add(b, -c),
+                            _ => unreachable!(),
+                        };
+                        self.fregs[rd] = Self::nanbox_f32(out.to_bits());
+                    }
+                    1 => {
+                        let a = Self::f64_from_reg(self.fregs[rs1]);
+                        let b = Self::f64_from_reg(self.fregs[rs2]);
+                        let c = Self::f64_from_reg(self.fregs[rs3]);
+                        let out = match opcode {
+                            OPCODE_MADD => a.mul_add(b, c),
+                            OPCODE_MSUB => a.mul_add(b, -c),
+                            OPCODE_NMSUB => (-a).mul_add(b, c),
+                            OPCODE_NMADD => (-a).mul_add(b, -c),
+                            _ => unreachable!(),
+                        };
+                        self.fregs[rd] = out.to_bits();
+                    }
+                    _ => return Err(Trap::IllegalInstruction(instr)),
+                }
+            }
             OPCODE_BRANCH => {
                 let imm_b = Self::imm_b(instr) as u64;
                 let a = self.regs[rs1];
@@ -88,7 +255,7 @@ impl Hart {
                 match funct3 {
                     2 => {
                         let val = self.read_u32(bus, addr, AccessType::Load)?;
-                        self.fregs[rd] = val as u64;
+                        self.fregs[rd] = Self::nanbox_f32(val);
                     }
                     3 => {
                         let val = self.read_u64(bus, addr, AccessType::Load)?;
@@ -294,6 +461,265 @@ impl Hart {
                     _ => return Err(Trap::IllegalInstruction(instr)),
                 };
                 self.regs[rd] = res32 as i64 as u64;
+            }
+            OPCODE_OP_FP => {
+                match funct7 {
+                    0x00 => {
+                        if !Self::rm_legal(funct3) {
+                            return Err(Trap::IllegalInstruction(instr));
+                        }
+                        let a = Self::f32_from_reg(self.fregs[rs1]);
+                        let b = Self::f32_from_reg(self.fregs[rs2]);
+                        self.fregs[rd] = Self::nanbox_f32((a + b).to_bits());
+                    }
+                    0x01 => {
+                        if !Self::rm_legal(funct3) {
+                            return Err(Trap::IllegalInstruction(instr));
+                        }
+                        let a = Self::f64_from_reg(self.fregs[rs1]);
+                        let b = Self::f64_from_reg(self.fregs[rs2]);
+                        self.fregs[rd] = (a + b).to_bits();
+                    }
+                    0x04 => {
+                        if !Self::rm_legal(funct3) {
+                            return Err(Trap::IllegalInstruction(instr));
+                        }
+                        let a = Self::f32_from_reg(self.fregs[rs1]);
+                        let b = Self::f32_from_reg(self.fregs[rs2]);
+                        self.fregs[rd] = Self::nanbox_f32((a - b).to_bits());
+                    }
+                    0x05 => {
+                        if !Self::rm_legal(funct3) {
+                            return Err(Trap::IllegalInstruction(instr));
+                        }
+                        let a = Self::f64_from_reg(self.fregs[rs1]);
+                        let b = Self::f64_from_reg(self.fregs[rs2]);
+                        self.fregs[rd] = (a - b).to_bits();
+                    }
+                    0x08 => {
+                        if !Self::rm_legal(funct3) {
+                            return Err(Trap::IllegalInstruction(instr));
+                        }
+                        let a = Self::f32_from_reg(self.fregs[rs1]);
+                        let b = Self::f32_from_reg(self.fregs[rs2]);
+                        self.fregs[rd] = Self::nanbox_f32((a * b).to_bits());
+                    }
+                    0x09 => {
+                        if !Self::rm_legal(funct3) {
+                            return Err(Trap::IllegalInstruction(instr));
+                        }
+                        let a = Self::f64_from_reg(self.fregs[rs1]);
+                        let b = Self::f64_from_reg(self.fregs[rs2]);
+                        self.fregs[rd] = (a * b).to_bits();
+                    }
+                    0x0c => {
+                        if !Self::rm_legal(funct3) {
+                            return Err(Trap::IllegalInstruction(instr));
+                        }
+                        let a = Self::f32_from_reg(self.fregs[rs1]);
+                        let b = Self::f32_from_reg(self.fregs[rs2]);
+                        self.fregs[rd] = Self::nanbox_f32((a / b).to_bits());
+                    }
+                    0x0d => {
+                        if !Self::rm_legal(funct3) {
+                            return Err(Trap::IllegalInstruction(instr));
+                        }
+                        let a = Self::f64_from_reg(self.fregs[rs1]);
+                        let b = Self::f64_from_reg(self.fregs[rs2]);
+                        self.fregs[rd] = (a / b).to_bits();
+                    }
+                    0x10 => {
+                        let a = Self::f32_bits_from_reg(self.fregs[rs1]);
+                        let b = Self::f32_bits_from_reg(self.fregs[rs2]);
+                        let sign = match funct3 {
+                            0 => b & 0x8000_0000,
+                            1 => (!b) & 0x8000_0000,
+                            2 => (a ^ b) & 0x8000_0000,
+                            _ => return Err(Trap::IllegalInstruction(instr)),
+                        };
+                        self.fregs[rd] = Self::nanbox_f32((a & 0x7fff_ffff) | sign);
+                    }
+                    0x11 => {
+                        let a = self.fregs[rs1];
+                        let b = self.fregs[rs2];
+                        let sign = match funct3 {
+                            0 => b & 0x8000_0000_0000_0000,
+                            1 => (!b) & 0x8000_0000_0000_0000,
+                            2 => (a ^ b) & 0x8000_0000_0000_0000,
+                            _ => return Err(Trap::IllegalInstruction(instr)),
+                        };
+                        self.fregs[rd] = (a & 0x7fff_ffff_ffff_ffff) | sign;
+                    }
+                    0x14 => {
+                        let a = Self::f32_from_reg(self.fregs[rs1]);
+                        let b = Self::f32_from_reg(self.fregs[rs2]);
+                        let out = match funct3 {
+                            0 => a.min(b),
+                            1 => a.max(b),
+                            _ => return Err(Trap::IllegalInstruction(instr)),
+                        };
+                        self.fregs[rd] = Self::nanbox_f32(out.to_bits());
+                    }
+                    0x15 => {
+                        let a = Self::f64_from_reg(self.fregs[rs1]);
+                        let b = Self::f64_from_reg(self.fregs[rs2]);
+                        let out = match funct3 {
+                            0 => a.min(b),
+                            1 => a.max(b),
+                            _ => return Err(Trap::IllegalInstruction(instr)),
+                        };
+                        self.fregs[rd] = out.to_bits();
+                    }
+                    0x20 => {
+                        if rs2 != 1 || !Self::rm_legal(funct3) {
+                            return Err(Trap::IllegalInstruction(instr));
+                        }
+                        let a = Self::f64_from_reg(self.fregs[rs1]);
+                        self.fregs[rd] = Self::nanbox_f32((a as f32).to_bits());
+                    }
+                    0x21 => {
+                        if rs2 != 0 || !Self::rm_legal(funct3) {
+                            return Err(Trap::IllegalInstruction(instr));
+                        }
+                        let a = Self::f32_from_reg(self.fregs[rs1]);
+                        self.fregs[rd] = (a as f64).to_bits();
+                    }
+                    0x2c => {
+                        if rs2 != 0 || !Self::rm_legal(funct3) {
+                            return Err(Trap::IllegalInstruction(instr));
+                        }
+                        let a = Self::f32_from_reg(self.fregs[rs1]);
+                        self.fregs[rd] = Self::nanbox_f32(a.sqrt().to_bits());
+                    }
+                    0x2d => {
+                        if rs2 != 0 || !Self::rm_legal(funct3) {
+                            return Err(Trap::IllegalInstruction(instr));
+                        }
+                        let a = Self::f64_from_reg(self.fregs[rs1]);
+                        self.fregs[rd] = a.sqrt().to_bits();
+                    }
+                    0x50 => {
+                        let a = Self::f32_from_reg(self.fregs[rs1]);
+                        let b = Self::f32_from_reg(self.fregs[rs2]);
+                        let out = match funct3 {
+                            0 => (a <= b) as u64,
+                            1 => (a < b) as u64,
+                            2 => (a == b) as u64,
+                            _ => return Err(Trap::IllegalInstruction(instr)),
+                        };
+                        self.regs[rd] = out;
+                    }
+                    0x51 => {
+                        let a = Self::f64_from_reg(self.fregs[rs1]);
+                        let b = Self::f64_from_reg(self.fregs[rs2]);
+                        let out = match funct3 {
+                            0 => (a <= b) as u64,
+                            1 => (a < b) as u64,
+                            2 => (a == b) as u64,
+                            _ => return Err(Trap::IllegalInstruction(instr)),
+                        };
+                        self.regs[rd] = out;
+                    }
+                    0x60 => {
+                        if !Self::rm_legal(funct3) {
+                            return Err(Trap::IllegalInstruction(instr));
+                        }
+                        let a = Self::f32_from_reg(self.fregs[rs1]) as f64;
+                        let out = match rs2 {
+                            0 => Self::fcvt_f64_to_i64(a, funct3) as i32 as i64 as u64,
+                            1 => {
+                                let v = Self::fcvt_f64_to_u64(a, funct3) as u32;
+                                (v as i32 as i64) as u64
+                            }
+                            2 => Self::fcvt_f64_to_i64(a, funct3) as u64,
+                            3 => Self::fcvt_f64_to_u64(a, funct3),
+                            _ => return Err(Trap::IllegalInstruction(instr)),
+                        };
+                        self.regs[rd] = out;
+                    }
+                    0x61 => {
+                        if !Self::rm_legal(funct3) {
+                            return Err(Trap::IllegalInstruction(instr));
+                        }
+                        let a = Self::f64_from_reg(self.fregs[rs1]);
+                        let out = match rs2 {
+                            0 => Self::fcvt_f64_to_i64(a, funct3) as i32 as i64 as u64,
+                            1 => {
+                                let v = Self::fcvt_f64_to_u64(a, funct3) as u32;
+                                (v as i32 as i64) as u64
+                            }
+                            2 => Self::fcvt_f64_to_i64(a, funct3) as u64,
+                            3 => Self::fcvt_f64_to_u64(a, funct3),
+                            _ => return Err(Trap::IllegalInstruction(instr)),
+                        };
+                        self.regs[rd] = out;
+                    }
+                    0x68 => {
+                        if !Self::rm_legal(funct3) {
+                            return Err(Trap::IllegalInstruction(instr));
+                        }
+                        let out = match rs2 {
+                            0 => (self.regs[rs1] as i32) as f32,
+                            1 => (self.regs[rs1] as u32) as f32,
+                            2 => (self.regs[rs1] as i64) as f32,
+                            3 => self.regs[rs1] as f32,
+                            _ => return Err(Trap::IllegalInstruction(instr)),
+                        };
+                        self.fregs[rd] = Self::nanbox_f32(out.to_bits());
+                    }
+                    0x69 => {
+                        if !Self::rm_legal(funct3) {
+                            return Err(Trap::IllegalInstruction(instr));
+                        }
+                        let out = match rs2 {
+                            0 => (self.regs[rs1] as i32) as f64,
+                            1 => (self.regs[rs1] as u32) as f64,
+                            2 => (self.regs[rs1] as i64) as f64,
+                            3 => self.regs[rs1] as f64,
+                            _ => return Err(Trap::IllegalInstruction(instr)),
+                        };
+                        self.fregs[rd] = out.to_bits();
+                    }
+                    0x70 => {
+                        if rs2 != 0 {
+                            return Err(Trap::IllegalInstruction(instr));
+                        }
+                        match funct3 {
+                            0 => {
+                                let bits = Self::f32_bits_from_reg(self.fregs[rs1]);
+                                self.regs[rd] = (bits as i32 as i64) as u64;
+                            }
+                            1 => {
+                                let bits = Self::f32_bits_from_reg(self.fregs[rs1]);
+                                self.regs[rd] = Self::fclass_f32(bits);
+                            }
+                            _ => return Err(Trap::IllegalInstruction(instr)),
+                        }
+                    }
+                    0x71 => {
+                        if rs2 != 0 {
+                            return Err(Trap::IllegalInstruction(instr));
+                        }
+                        match funct3 {
+                            0 => self.regs[rd] = self.fregs[rs1],
+                            1 => self.regs[rd] = Self::fclass_f64(self.fregs[rs1]),
+                            _ => return Err(Trap::IllegalInstruction(instr)),
+                        }
+                    }
+                    0x78 => {
+                        if rs2 != 0 || funct3 != 0 {
+                            return Err(Trap::IllegalInstruction(instr));
+                        }
+                        self.fregs[rd] = Self::nanbox_f32(self.regs[rs1] as u32);
+                    }
+                    0x79 => {
+                        if rs2 != 0 || funct3 != 0 {
+                            return Err(Trap::IllegalInstruction(instr));
+                        }
+                        self.fregs[rd] = self.regs[rs1];
+                    }
+                    _ => return Err(Trap::IllegalInstruction(instr)),
+                }
             }
             OPCODE_SYSTEM => match funct3 {
                 F3_SYSTEM => match imm12 {
@@ -872,7 +1298,11 @@ impl Hart {
         Ok(())
     }
 
-    pub(super) fn exec_compressed(&mut self, bus: &mut impl Bus, instr: u16) -> Result<(), Trap> {
+    pub(super) fn exec_compressed(
+        &mut self,
+        bus: &mut (impl Bus + ?Sized),
+        instr: u16,
+    ) -> Result<(), Trap> {
         let funct3 = (instr >> 13) & 0x7;
         let op = instr & 0x3;
         let mut next_pc = self.pc.wrapping_add(2);

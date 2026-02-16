@@ -276,6 +276,7 @@ impl Hart {
         }
     }
 
+    #[cfg(target_arch = "aarch64")]
     fn emit_native_term_helper32(
         &self,
         em: &mut A64Emitter,
@@ -285,6 +286,9 @@ impl Hart {
         prefix_count: u32,
     ) -> bool {
         let opcode = d.opcode as u32;
+        if opcode == OPCODE_SYSTEM {
+            return false;
+        }
         if opcode == OPCODE_LOAD || opcode == OPCODE_STORE {
             let funct3 = d.funct3 as u32;
             let rs1 = d.rs1 as usize;
@@ -324,7 +328,7 @@ impl Hart {
             // x0=regs_ptr, x1=hart_ptr, x2=bus_data, x3=bus_vtable.
             // Helper args:
             //   x0=hart_ptr, x1=bus_data, x2=bus_vtable, x3=mem_op, x4=rd, x5=store_val,
-            //   x6=addr, x7=next_pc, x8=trap_pc
+            //   x6=addr, x7=pc
             em.emit(A64Emitter::mov_x(0, 1));
             em.emit(A64Emitter::mov_x(1, 2));
             em.emit(A64Emitter::mov_x(2, 3));
@@ -336,8 +340,7 @@ impl Hart {
                 em.mov_imm64(5, 0);
             }
             em.emit(A64Emitter::mov_x(6, 11));
-            em.mov_imm64(7, pc.wrapping_add(4));
-            em.mov_imm64(8, pc);
+            em.mov_imm64(7, pc);
             em.mov_imm64(
                 16,
                 Self::native_exec_mem_term_helper as *const () as usize as u64,
@@ -360,7 +363,6 @@ impl Hart {
             | OPCODE_AMO => {}
             _ => return false,
         }
-
         // x0=regs_ptr, x1=hart_ptr, x2=bus_data, x3=bus_vtable.
         // Call helper as:
         //   x0=hart_ptr, x1=bus_data, x2=bus_vtable, x3=sbi_data, x4=sbi_vtable,
@@ -447,12 +449,11 @@ impl Hart {
         rd: u64,
         store_val: u64,
         addr: u64,
-        next_pc: u64,
-        trap_pc: u64,
+        pc: u64,
     ) -> NativeBlockResult {
         if hart_ptr.is_null() || bus_data.is_null() || bus_vtable.is_null() {
             return NativeBlockResult {
-                next_pc: trap_pc,
+                next_pc: pc,
                 executed: 0,
             };
         }
@@ -508,16 +509,16 @@ impl Hart {
                     hart.regs[rd] = v;
                 }
                 NativeBlockResult {
-                    next_pc,
+                    next_pc: pc.wrapping_add(4),
                     executed: 1,
                 }
             }
             Err(trap) => {
-                hart.pc = trap_pc;
+                hart.pc = pc;
                 hart.handle_trap(trap);
                 NativeBlockResult {
                     next_pc: hart.pc,
-                    executed: 1,
+                    executed: NATIVE_EXEC_FLAG_LAST_TRAP | 1,
                 }
             }
         }
@@ -564,7 +565,7 @@ impl Hart {
                 hart.handle_trap(trap);
                 return NativeBlockResult {
                     next_pc: hart.pc,
-                    executed: 1,
+                    executed: NATIVE_EXEC_FLAG_LAST_TRAP | 1,
                 };
             }
         };
@@ -726,7 +727,7 @@ impl Hart {
                 hart.handle_trap(trap);
                 NativeBlockResult {
                     next_pc: hart.pc,
-                    executed: 1,
+                    executed: NATIVE_EXEC_FLAG_LAST_TRAP | 1,
                 }
             }
         }
@@ -1108,17 +1109,6 @@ impl Hart {
         }
     }
 
-    #[cfg(not(target_arch = "aarch64"))]
-    fn emit_native_instr(
-        &self,
-        _em: &mut (),
-        _pc: u64,
-        _instr: u32,
-        _d: Decoded32,
-    ) -> Option<EmitFlow> {
-        None
-    }
-
     #[cfg(target_arch = "aarch64")]
     fn compile_native_block(
         &mut self,
@@ -1305,7 +1295,7 @@ impl Hart {
         Ok(Some(block))
     }
 
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     fn compile_native_block(
         &mut self,
         _bus: &mut impl Bus,
@@ -1314,6 +1304,7 @@ impl Hart {
         Ok(None)
     }
 
+    #[cfg(not(target_arch = "x86_64"))]
     pub fn try_run_native_jit(
         &mut self,
         bus: &mut impl Bus,
@@ -1339,7 +1330,7 @@ impl Hart {
                     self.native_jit.enabled
                 );
             }
-            if !self.native_jit.enabled || max_steps < 2 || self.has_debug_hooks() {
+            if !self.native_jit.enabled || max_steps < 1 || self.has_debug_hooks() {
                 return Ok(None);
             }
             if self.time_jitter_enabled {
@@ -1410,30 +1401,38 @@ impl Hart {
                         sbi_vtable,
                     )
                 };
-                if res.executed != block.instrs as u64 || res.executed == 0 {
+                let done_raw = res.executed;
+                let done = (done_raw & !NATIVE_EXEC_FLAG_LAST_TRAP) as u32;
+                if done != block.instrs || done == 0 {
                     break;
                 }
 
-                let done = res.executed as u32;
                 self.pc = res.next_pc;
                 self.regs[0] = 0;
                 done_total = done_total.saturating_add(done);
                 remaining = remaining.saturating_sub(done);
+
+                // Match interpreter-visible timing/accounting semantics between
+                // native blocks, so subsequent helpers (e.g. CSR reads) observe
+                // up-to-date counters.
+                let retired = done.saturating_sub(((done_raw & NATIVE_EXEC_FLAG_LAST_TRAP) != 0) as u32);
+                self.instret_pending = self.instret_pending.wrapping_add(retired as u64);
+                let total = self.time_div_accum.saturating_add(done);
+                if total >= self.time_divider {
+                    let ticks = total / self.time_divider;
+                    self.time_div_accum = total % self.time_divider;
+                    self.csrs.increment_time(ticks as u64);
+                } else {
+                    self.time_div_accum = total;
+                }
+                self.irq_check_countdown = self.irq_check_countdown.saturating_sub(done);
+                if self.irq_check_countdown <= 1 {
+                    break;
+                }
             }
             if done_total == 0 {
                 return Ok(None);
             }
-            self.instret_pending = self.instret_pending.wrapping_add(done_total as u64);
-
-            let total = self.time_div_accum.saturating_add(done_total);
-            if total >= self.time_divider {
-                let ticks = total / self.time_divider;
-                self.time_div_accum = total % self.time_divider;
-                self.csrs.increment_time(ticks as u64);
-            } else {
-                self.time_div_accum = total;
-            }
-            self.irq_check_countdown = self.irq_check_countdown.saturating_sub(done_total);
             Ok(Some(done_total))
         }
     }

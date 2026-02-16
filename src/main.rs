@@ -612,8 +612,14 @@ fn main() {
         std::process::exit(1);
     }
 
-    let default_ext =
-        (1u64 << 8) | (1u64 << 12) | (1u64 << 0) | (1u64 << 2) | (1u64 << 18) | (1u64 << 20);
+    let default_ext = (1u64 << 8)
+        | (1u64 << 12)
+        | (1u64 << 0)
+        | (1u64 << 2)
+        | (1u64 << 5)
+        | (1u64 << 3)
+        | (1u64 << 18)
+        | (1u64 << 20);
     let ext_mask = ext_mask.unwrap_or(default_ext);
     let mut system = System::new(1, ram_base, ram_size, ext_mask);
     system.set_trace_traps(trace_traps);
