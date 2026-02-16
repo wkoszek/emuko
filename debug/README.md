@@ -1,13 +1,13 @@
-# KoRISCV Debug Scripts
+# emuko Debug Scripts
 
-These scripts are for repeatable `kor`/`koriscvd` probing.
+These scripts are for repeatable `emu`/`emukod` probing.
 
 ## Prerequisites
 
 1. Build binaries:
    - `cargo build --release`
 2. Ensure snapshot exists (default used by scripts):
-   - `/tmp/korisc5-rd/snap-00000000002600400005.kriscv.zst`
+   - `/tmp/emuko-rd/snap-00000000002600400005.emuko.zst`
 
 ## Scripts
 
@@ -15,10 +15,10 @@ These scripts are for repeatable `kor`/`koriscvd` probing.
   - Starts a daemon from snapshot.
   - Runs to shell prompt.
   - Injects UART command (`ls -la\n` by default).
-  - Captures UART output and state snapshots into `/tmp/korisc5-debug/`.
+  - Captures UART output and state snapshots into `/tmp/emuko-debug/`.
 
 - `debug/poll_state.sh`
-  - Polls `kor dump` repeatedly.
+  - Polls `emu dump` repeatedly.
   - Useful for seeing a stuck PC/instruction loop in real time.
 
 - `debug/proba_all_basic.sh`
@@ -29,7 +29,7 @@ These scripts are for repeatable `kor`/`koriscvd` probing.
     - `uname -a`
     - `echo sample`
     - `echo sample > file`
-  - Captures UART and state logs into `/tmp/korisc5-debug/`.
+  - Captures UART and state logs into `/tmp/emuko-debug/`.
 
 ## Typical usage
 
@@ -42,16 +42,16 @@ debug/proba_all_basic.sh
 ```
 
 ```bash
-KOR_ADDR=127.0.0.1:7788 debug/poll_state.sh
+EMUKO_ADDR=127.0.0.1:7788 debug/poll_state.sh
 ```
 
 ## Useful env vars
 
 - `SNAPSHOT`
-- `KOR_ADDR`
+- `EMUKO_ADDR`
 - `CHUNK_STEPS`
 - `BOOT_LOOPS`
 - `POST_LOOPS`
 - `STEP_SLEEP`
-- `CMD_ESC` (default: `ls -la\\n`)
+- `CMD_ESC` (default: `ls -la\n`)
 - `KEEP_DAEMON=1` (do not stop daemon at script exit)

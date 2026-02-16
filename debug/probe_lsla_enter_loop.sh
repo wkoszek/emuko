@@ -4,9 +4,9 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-KOR_BIN="${KOR_BIN:-target/release/kor}"
-KOR_ADDR="${KOR_ADDR:-127.0.0.1:7788}"
-LOG_DIR="${LOG_DIR:-/tmp/korisc5-debug}"
+EMU_BIN="${EMU_BIN:-target/release/emu}"
+EMUKO_ADDR="${EMUKO_ADDR:-127.0.0.1:7788}"
+LOG_DIR="${LOG_DIR:-/tmp/emuko-debug}"
 POLL_COUNT="${POLL_COUNT:-24}"
 POLL_SLEEP="${POLL_SLEEP:-0.25}"
 UART_READ_MAX="${UART_READ_MAX:-200000}"
@@ -17,13 +17,13 @@ STATE_LOG="$LOG_DIR/lsla-loop-state-$TS.log"
 UART_LOG="$LOG_DIR/lsla-loop-uart-$TS.log"
 SNAP_LOG="$LOG_DIR/lsla-loop-snapshot-$TS.log"
 
-if [[ ! -x "$KOR_BIN" ]]; then
-  echo "Missing binary: $KOR_BIN. Run: cargo build --release" >&2
+if [[ ! -x "$EMU_BIN" ]]; then
+  echo "Missing binary: $EMU_BIN. Run: cargo build --release" >&2
   exit 1
 fi
 
 kor() {
-  KOR_ADDR="$KOR_ADDR" "$KOR_BIN" "$@"
+  EMUKO_ADDR="$EMUKO_ADDR" "$EMU_BIN" "$@"
 }
 
 kor_retry() {
@@ -65,9 +65,9 @@ capture_uart() {
   fi
 }
 
-echo "Probing daemon at $KOR_ADDR"
+echo "Probing daemon at $EMUKO_ADDR"
 if ! kor_retry dump >/dev/null; then
-  echo "Daemon is not reachable at $KOR_ADDR" >&2
+  echo "Daemon is not reachable at $EMUKO_ADDR" >&2
   exit 1
 fi
 

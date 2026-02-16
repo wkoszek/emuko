@@ -4,17 +4,17 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-KOR_BIN="${KOR_BIN:-target/release/kor}"
-DAEMON_BIN="${DAEMON_BIN:-target/release/koriscvd}"
-KOR_ADDR="${KOR_ADDR:-127.0.0.1:7788}"
-SNAPSHOT="${SNAPSHOT:-/tmp/korisc5-rd/snap-00000000002600400005.kriscv.zst}"
-SNAPSHOT_DIR="${SNAPSHOT_DIR:-/tmp/korisc5-rd}"
+EMU_BIN="${EMU_BIN:-target/release/emu}"
+DAEMON_BIN="${DAEMON_BIN:-target/release/emukod}"
+EMUKO_ADDR="${EMUKO_ADDR:-127.0.0.1:7788}"
+SNAPSHOT="${SNAPSHOT:-/tmp/emuko-rd/snap-00000000002600400005.emuko.zst}"
+SNAPSHOT_DIR="${SNAPSHOT_DIR:-/tmp/emuko-rd}"
 CHUNK_STEPS="${CHUNK_STEPS:-10000}"
 STEP_SLEEP="${STEP_SLEEP:-0.08}"
 BOOT_LOOPS="${BOOT_LOOPS:-40}"
 POST_LOOPS="${POST_LOOPS:-60}"
 CMD_ESC="${CMD_ESC:-ls -la\\n}"
-LOG_DIR="${LOG_DIR:-/tmp/korisc5-debug}"
+LOG_DIR="${LOG_DIR:-/tmp/emuko-debug}"
 KEEP_DAEMON="${KEEP_DAEMON:-0}"
 
 mkdir -p "$LOG_DIR"
@@ -24,7 +24,7 @@ STATE_LOG="$LOG_DIR/state-$TS.jsonl"
 DAEMON_LOG="$LOG_DIR/daemon-$TS.log"
 touch "$UART_LOG" "$STATE_LOG" "$DAEMON_LOG"
 
-if [[ ! -x "$KOR_BIN" || ! -x "$DAEMON_BIN" ]]; then
+if [[ ! -x "$EMU_BIN" || ! -x "$DAEMON_BIN" ]]; then
   echo "Missing binaries. Run: cargo build --release" >&2
   exit 1
 fi
@@ -35,7 +35,7 @@ if [[ ! -f "$SNAPSHOT" ]]; then
 fi
 
 kor() {
-  KOR_ADDR="$KOR_ADDR" "$KOR_BIN" "$@"
+  EMUKO_ADDR="$EMUKO_ADDR" "$EMU_BIN" "$@"
 }
 
 kor_retry() {
@@ -62,10 +62,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "Starting daemon at $KOR_ADDR (snapshot: $SNAPSHOT)"
+echo "Starting daemon at $EMUKO_ADDR (snapshot: $SNAPSHOT)"
 "$DAEMON_BIN" \
   --snapshot "$SNAPSHOT" \
-  --addr "$KOR_ADDR" \
+  --addr "$EMUKO_ADDR" \
   --snapshot-dir "$SNAPSHOT_DIR" \
   --chunk-steps "$CHUNK_STEPS" \
   >"$DAEMON_LOG" 2>&1 &

@@ -4,9 +4,9 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-KOR_BIN="${KOR_BIN:-target/release/kor}"
-KOR_ADDR="${KOR_ADDR:-127.0.0.1:7789}"
-LOG_DIR="${LOG_DIR:-/tmp/korisc5-debug}"
+EMU_BIN="${EMU_BIN:-target/release/emu}"
+EMUKO_ADDR="${EMUKO_ADDR:-127.0.0.1:7789}"
+LOG_DIR="${LOG_DIR:-/tmp/emuko-debug}"
 READ_CHUNK="${READ_CHUNK:-120000}"
 SLICE_SLEEP="${SLICE_SLEEP:-0.20}"
 MAX_SLICES="${MAX_SLICES:-220}"
@@ -18,7 +18,7 @@ UART_RAW="$LOG_DIR/repro-lsl-entries-uart-raw-$TS.log"
 STATE_LOG="$LOG_DIR/repro-lsl-entries-state-$TS.log"
 
 kor() {
-  KOR_ADDR="$KOR_ADDR" "$KOR_BIN" "$@"
+  EMUKO_ADDR="$EMUKO_ADDR" "$EMU_BIN" "$@"
 }
 
 kor_retry() {
@@ -94,7 +94,7 @@ run_lsl_entry() {
 }
 
 if ! kor_retry dump >/dev/null; then
-  echo "Daemon not reachable at $KOR_ADDR" >&2
+  echo "Daemon not reachable at $EMUKO_ADDR" >&2
   exit 1
 fi
 
