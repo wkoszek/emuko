@@ -1,97 +1,15 @@
-mod bus;
-mod clint;
-mod csr;
-mod dev;
-mod disas;
-mod efi;
-mod fdt;
-mod hart;
-mod isa;
-mod pe;
-mod plic;
-mod sbi;
-mod snapshot;
-mod system;
-mod trap;
-
-use crate::bus::Bus;
 use std::env;
 use std::fs;
-use std::path::Path;
-use std::time::Duration;
-use system::{System, DEFAULT_RAM_BASE, DEFAULT_RAM_SIZE};
-use trap::Trap;
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
-fn print_usage() {
-    eprintln!(
-        "Usage: emuko <binary> [--steps N] [--load-addr ADDR] [--entry-addr ADDR] [--ram-base ADDR] [--ram-size BYTES] [--dtb FILE] [--dtb-addr ADDR] [--initrd FILE] [--initrd-addr ADDR] [--linux] [--ext EXT] [--bootargs STR] [--trace-traps N] [--trace-instr N] [--save-snapshot FILE] [--load-snapshot FILE] [--autosnapshot-every N] [--autosnapshot-dir DIR] [--perf-report-count N] [--perf-report-secs S] [--perf-check-ticks N] [--uart-poll-wall-ms N] [--uart-poll-calib-ms N] [--uart-poll-check-ticks N] [--uart-poll-ticks N] [--uart-flush-every N] [--no-dump]"
-    );
-}
+const REGISTRY_JSON: &str = include_str!("../registry.json");
 
-enum RunFailure {
-    Trap(Trap),
-    Snapshot(String),
-}
-
-fn print_trap(trap: Trap) {
-    match trap {
-        Trap::Ecall => println!("ECALL"),
-        Trap::Ebreak => println!("EBREAK"),
-        Trap::IllegalInstruction(instr) => {
-            eprintln!("Illegal instruction 0x{:08x}", instr)
-        }
-        Trap::MisalignedAccess { addr, size } => {
-            eprintln!("Misaligned access addr=0x{:016x} size={}", addr, size)
-        }
-        Trap::MemoryOutOfBounds { addr, size } => {
-            eprintln!("Out of bounds addr=0x{:016x} size={}", addr, size)
-        }
-        Trap::PageFault { addr, .. } => {
-            eprintln!("Page fault addr=0x{:016x}", addr)
-        }
-    }
-}
-
-fn run_with_autosnapshot(
-    system: &mut System,
-    max_steps: Option<u64>,
-    autosnapshot_every: Option<u64>,
-    autosnapshot_dir: &str,
-) -> Result<u64, RunFailure> {
-    let every = autosnapshot_every.unwrap_or(0);
-    if every == 0 {
-        return system.run(max_steps).map_err(RunFailure::Trap);
-    }
-    fs::create_dir_all(autosnapshot_dir).map_err(|e| {
-        RunFailure::Snapshot(format!("failed to create {}: {}", autosnapshot_dir, e))
-    })?;
-
-    let mut completed = 0u64;
-    loop {
-        let remaining = max_steps.map(|limit| limit.saturating_sub(completed));
-        if remaining == Some(0) {
-            return Ok(completed);
-        }
-        let chunk = remaining.map_or(every, |left| left.min(every));
-        if chunk == 0 {
-            return Ok(completed);
-        }
-        let ran = system.run(Some(chunk)).map_err(RunFailure::Trap)?;
-        completed = completed.saturating_add(ran);
-        let snap_path = format!(
-            "{}/snap-{:020}.emuko.zst",
-            autosnapshot_dir,
-            system.total_steps()
-        );
-        system
-            .save_snapshot(&snap_path)
-            .map_err(|e| RunFailure::Snapshot(format!("failed to save {}: {}", snap_path, e)))?;
-        eprintln!("Autosaved snapshot {}", snap_path);
-        if ran < chunk {
-            return Ok(completed);
-        }
-    }
-}
+// ---------------------------------------------------------------------------
+// Utility functions
+// ---------------------------------------------------------------------------
 
 fn parse_u64(arg: &str) -> Option<u64> {
     if let Some(hex) = arg.strip_prefix("0x") {
@@ -101,961 +19,513 @@ fn parse_u64(arg: &str) -> Option<u64> {
     }
 }
 
-fn parse_f64(arg: &str) -> Option<f64> {
-    arg.parse::<f64>().ok()
-}
-
-#[derive(Default)]
-struct RuntimeTuning {
-    perf_report_count: Option<u32>,
-    perf_report_secs: Option<f64>,
-    perf_check_ticks: Option<u32>,
-    uart_poll_wall_ms: Option<u64>,
-    uart_poll_calib_ms: Option<u64>,
-    uart_poll_check_ticks: Option<u32>,
-    uart_poll_ticks: Option<u32>,
-    uart_flush_every: Option<usize>,
-}
-
-impl RuntimeTuning {
-    fn apply(&self, system: &mut System) -> Result<(), String> {
-        let perf_interval = self.perf_report_secs.map(Duration::from_secs_f64);
-        system.configure_perf_reporting(
-            self.perf_report_count,
-            perf_interval,
-            self.perf_check_ticks,
-        );
-
-        if let Some(ticks) = self.uart_poll_ticks {
-            system.configure_uart_poll_fixed(ticks)?;
-        } else if self.uart_poll_wall_ms.is_some()
-            || self.uart_poll_calib_ms.is_some()
-            || self.uart_poll_check_ticks.is_some()
-        {
-            let wall_ms = self.uart_poll_wall_ms.unwrap_or(100);
-            let calib_ms = self.uart_poll_calib_ms.unwrap_or(250);
-            let check_ticks = self.uart_poll_check_ticks.unwrap_or(2048).max(1);
-            system.configure_uart_poll_auto(
-                Duration::from_millis(wall_ms),
-                Duration::from_millis(calib_ms),
-                check_ticks,
-            )?;
-        }
-
-        if let Some(every) = self.uart_flush_every {
-            system.configure_uart_flush_every(every)?;
-        }
-        Ok(())
-    }
-}
-
-fn ext_mask_from_str(arg: &str) -> Option<u64> {
-    let mut mask = 0u64;
-    for ch in arg.chars() {
-        if ch == ',' || ch == ' ' {
+fn decode_escapes(s: &str) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(s.len());
+    let mut it = s.chars().peekable();
+    while let Some(ch) = it.next() {
+        if ch != '\\' {
+            out.push(ch as u8);
             continue;
         }
-        let bit = match ch.to_ascii_uppercase() {
-            'A' => 0,
-            'C' => 2,
-            'D' => 3,
-            'F' => 5,
-            'I' => 8,
-            'M' => 12,
-            'S' => 18,
-            'U' => 20,
-            _ => return None,
+        let Some(next) = it.next() else {
+            out.push(b'\\');
+            break;
         };
-        mask |= 1u64 << bit;
+        match next {
+            'n' => out.push(b'\n'),
+            'r' => out.push(b'\r'),
+            't' => out.push(b'\t'),
+            '\\' => out.push(b'\\'),
+            'x' => {
+                let Some(h1) = it.next() else {
+                    return Err("incomplete \\x escape".to_string());
+                };
+                let Some(h2) = it.next() else {
+                    return Err("incomplete \\x escape".to_string());
+                };
+                let hi = h1
+                    .to_digit(16)
+                    .ok_or_else(|| "invalid \\x escape".to_string())?;
+                let lo = h2
+                    .to_digit(16)
+                    .ok_or_else(|| "invalid \\x escape".to_string())?;
+                out.push(((hi << 4) | lo) as u8);
+            }
+            other => out.push(other as u8),
+        }
     }
-    if mask == 0 {
-        None
+    Ok(out)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{:02x}", b));
+    }
+    out
+}
+
+fn http_get(addr: &str, path: &str) -> Result<(u16, String), String> {
+    let mut stream = TcpStream::connect(addr).map_err(|e| e.to_string())?;
+    let req = format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nAccept: */*\r\n\r\n",
+        path, addr
+    );
+    stream
+        .write_all(req.as_bytes())
+        .map_err(|e| e.to_string())?;
+    stream.flush().map_err(|e| e.to_string())?;
+    let mut bytes = Vec::new();
+    stream.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+    let text = String::from_utf8_lossy(&bytes);
+    let mut sections = text.splitn(2, "\r\n\r\n");
+    let head = sections.next().unwrap_or_default();
+    let body = sections.next().unwrap_or_default().to_string();
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(500);
+    Ok((status, body))
+}
+
+// ---------------------------------------------------------------------------
+// `emuko dow` — download command
+// ---------------------------------------------------------------------------
+
+struct RegistryFile {
+    url: String,
+    save_as: String,
+    sha256: String,
+    size: u64,
+}
+
+struct RegistrySet {
+    name: String,
+    arch: String,
+    files: Vec<RegistryFile>,
+}
+
+fn json_str_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let pat = format!("\"{}\"", key);
+    let idx = line.find(&pat)?;
+    let after = &line[idx + pat.len()..];
+    let colon = after.find(':')?;
+    let rest = after[colon + 1..].trim();
+    if rest.starts_with('"') {
+        let inner = &rest[1..];
+        let end = inner.find('"')?;
+        Some(&inner[..end])
     } else {
-        Some(mask)
+        let end = inner_token_end(rest);
+        Some(&rest[..end])
     }
 }
 
-fn isa_string_from_mask(mask: u64) -> String {
-    let mut s = String::from("rv64i");
-    let has = |bit: u64| (mask & (1u64 << bit)) != 0;
-    if has(12) {
-        s.push('m');
-    }
-    if has(0) {
-        s.push('a');
-    }
-    if has(5) {
-        s.push('f');
-    }
-    if has(3) {
-        s.push('d');
-    }
-    if has(2) {
-        s.push('c');
-    }
-    s
+fn inner_token_end(s: &str) -> usize {
+    s.find(|c: char| c == ',' || c == '}' || c == ']' || c.is_whitespace())
+        .unwrap_or(s.len())
 }
 
-fn align_up(val: u64, align: u64) -> u64 {
-    (val + align - 1) & !(align - 1)
+fn parse_registry(json: &str) -> Vec<RegistrySet> {
+    let mut sets = Vec::new();
+    let lines: Vec<&str> = json.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i].trim();
+        if line.starts_with('"') && line.contains("}: {") == false && line.ends_with('{') {
+            if let Some(end) = line[1..].find('"') {
+                let set_name = &line[1..1 + end];
+                if set_name == "sets" {
+                    i += 1;
+                    continue;
+                }
+                let mut arch = String::new();
+                let mut files = Vec::new();
+                i += 1;
+                let mut in_files = false;
+                let mut cur_url = String::new();
+                let mut cur_save = String::new();
+                let mut cur_sha = String::new();
+                let mut cur_size: u64 = 0;
+                let mut in_file_obj = false;
+                while i < lines.len() {
+                    let l = lines[i].trim();
+                    if !in_files {
+                        if let Some(v) = json_str_value(l, "arch") {
+                            arch = v.to_string();
+                        }
+                        if l.contains("\"files\"") {
+                            in_files = true;
+                        }
+                    } else if in_file_obj {
+                        if let Some(v) = json_str_value(l, "url") {
+                            cur_url = v.to_string();
+                        }
+                        if let Some(v) = json_str_value(l, "save_as") {
+                            cur_save = v.to_string();
+                        }
+                        if let Some(v) = json_str_value(l, "sha256") {
+                            cur_sha = v.to_string();
+                        }
+                        if let Some(v) = json_str_value(l, "size") {
+                            cur_size = v.parse::<u64>().unwrap_or(0);
+                        }
+                        if l.starts_with('}') {
+                            files.push(RegistryFile {
+                                url: cur_url.clone(),
+                                save_as: cur_save.clone(),
+                                sha256: cur_sha.clone(),
+                                size: cur_size,
+                            });
+                            cur_url.clear();
+                            cur_save.clear();
+                            cur_sha.clear();
+                            cur_size = 0;
+                            in_file_obj = false;
+                        }
+                    } else {
+                        if l.starts_with('{') {
+                            in_file_obj = true;
+                        }
+                        if l.starts_with(']') {
+                            break;
+                        }
+                    }
+                    i += 1;
+                }
+                sets.push(RegistrySet {
+                    name: set_name.to_string(),
+                    arch,
+                    files,
+                });
+            }
+        }
+        i += 1;
+    }
+    sets
 }
 
-fn align_down(val: u64, align: u64) -> u64 {
-    val & !(align - 1)
+fn emuko_home() -> PathBuf {
+    if let Ok(v) = env::var("EMUKO_HOME") {
+        return PathBuf::from(v);
+    }
+    let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    PathBuf::from(home).join(".emuko")
+}
+
+fn format_size(bytes: u64) -> String {
+    if bytes >= 1_000_000 {
+        format!("{:.1} MB", bytes as f64 / 1_000_000.0)
+    } else if bytes >= 1_000 {
+        format!("{:.1} KB", bytes as f64 / 1_000.0)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+fn verify_sha256(path: &Path, expected: &str) -> bool {
+    let output = Command::new("shasum")
+        .args(["-a", "256"])
+        .arg(path)
+        .output();
+    match output {
+        Ok(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let computed = stdout.split_whitespace().next().unwrap_or("");
+            computed == expected
+        }
+        _ => false,
+    }
+}
+
+fn download_file(url: &str, dest: &Path) -> Result<(), String> {
+    let status = Command::new("curl")
+        .args(["-sL", "-o"])
+        .arg(dest)
+        .arg(url)
+        .status()
+        .map_err(|e| format!("failed to run curl: {}", e))?;
+    if !status.success() {
+        return Err(format!("curl exited with status {}", status));
+    }
+    Ok(())
+}
+
+fn run_dow(filter: Option<&str>) {
+    let sets = parse_registry(REGISTRY_JSON);
+    if sets.is_empty() {
+        eprintln!("No download sets found in registry.");
+        std::process::exit(1);
+    }
+
+    let selected: Vec<&RegistrySet> = if let Some(name) = filter {
+        let found: Vec<_> = sets.iter().filter(|s| s.name == name).collect();
+        if found.is_empty() {
+            eprintln!("Unknown set: {}", name);
+            eprintln!("Available sets:");
+            for s in &sets {
+                eprintln!("  {}", s.name);
+            }
+            std::process::exit(1);
+        }
+        found
+    } else {
+        sets.iter().collect()
+    };
+
+    let mut errors = 0;
+    for set in &selected {
+        let dir = emuko_home().join(&set.arch).join(&set.name);
+        if let Err(e) = fs::create_dir_all(&dir) {
+            eprintln!("Failed to create {}: {}", dir.display(), e);
+            errors += 1;
+            continue;
+        }
+        println!("[{}] -> {}", set.name, dir.display());
+
+        for file in &set.files {
+            let dest = dir.join(&file.save_as);
+
+            if dest.exists() && verify_sha256(&dest, &file.sha256) {
+                println!("  {} SKIP (already present, sha256 verified)", file.save_as);
+                continue;
+            }
+
+            println!(
+                "  Downloading {} ({})...",
+                file.save_as,
+                format_size(file.size)
+            );
+            match download_file(&file.url, &dest) {
+                Ok(()) => {
+                    if verify_sha256(&dest, &file.sha256) {
+                        println!("  {} OK (sha256 verified)", file.save_as);
+                    } else {
+                        eprintln!(
+                            "  {} FAILED: sha256 mismatch (expected {})",
+                            file.save_as, file.sha256
+                        );
+                        let _ = fs::remove_file(&dest);
+                        errors += 1;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("  {} FAILED: {}", file.save_as, e);
+                    errors += 1;
+                }
+            }
+        }
+    }
+    if errors > 0 {
+        eprintln!("{} file(s) failed", errors);
+        std::process::exit(1);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// emukod subprocess management
+// ---------------------------------------------------------------------------
+
+fn find_emukod() -> PathBuf {
+    if let Ok(v) = env::var("EMUKOD_BIN") {
+        return PathBuf::from(v);
+    }
+    if let Ok(exe) = env::current_exe() {
+        let mut p = exe.clone();
+        p.set_file_name("emukod");
+        if p.exists() {
+            return p;
+        }
+    }
+    PathBuf::from("emukod")
+}
+
+fn wait_for_api(addr: &str, timeout_secs: u64) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    while std::time::Instant::now() < deadline {
+        if http_get(addr, "/v1/api/dump").is_ok() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    false
+}
+
+fn run_start(args: &[String], addr: &str) {
+    let emukod = find_emukod();
+    let mut cmd = Command::new(&emukod);
+    cmd.args(args);
+    let child = cmd.spawn();
+    match child {
+        Ok(mut child) => {
+            eprintln!("Started emukod (pid {})", child.id());
+            if wait_for_api(addr, 30) {
+                eprintln!("emukod API ready at http://{}", addr);
+            } else {
+                eprintln!("Warning: emukod API not ready after 30s at {}", addr);
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        eprintln!("emukod exited with {}", status);
+                        std::process::exit(1);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("Failed to start emukod ({}): {}", emukod.display(), e);
+            std::process::exit(1);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HTTP client command dispatch
+// ---------------------------------------------------------------------------
+
+fn run_ctl(cmd: &str, args: &mut impl Iterator<Item = String>, addr: &str) {
+    let mut raw_output = false;
+    let path = match cmd {
+        "stop" => "/v1/api/stop".to_string(),
+        "con" | "continue" => "/v1/api/continue".to_string(),
+        "dump" => "/v1/api/dump".to_string(),
+        "disas" => "/v1/api/disas".to_string(),
+        "step" => {
+            if let Some(v) = args.next() {
+                if parse_u64(&v).is_none() {
+                    eprintln!("invalid step count: {}", v);
+                    std::process::exit(1);
+                }
+                format!("/v1/api/step/{}", v)
+            } else {
+                "/v1/api/step".to_string()
+            }
+        }
+        "restore" => {
+            let Some(name) = args.next() else {
+                eprintln!("Usage: emuko restore <snapshot>");
+                std::process::exit(1);
+            };
+            format!("/v1/api/restore/{}", name)
+        }
+        "ls" => "/v1/api/ls".to_string(),
+        "snap" => "/v1/api/snap".to_string(),
+        "set" => {
+            let Some(reg) = args.next() else {
+                eprintln!("Usage: emuko set <register> <value>");
+                std::process::exit(1);
+            };
+            let Some(val) = args.next() else {
+                eprintln!("Usage: emuko set <register> <value>");
+                std::process::exit(1);
+            };
+            if parse_u64(&val).is_none() {
+                eprintln!("invalid value: {}", val);
+                std::process::exit(1);
+            }
+            format!("/v1/api/set/{}/{}", reg, val)
+        }
+        "uart" | "uart-inject" => {
+            let rest: Vec<String> = args.collect();
+            if rest.is_empty() {
+                eprintln!("Usage: emuko uart-inject <text>");
+                std::process::exit(1);
+            }
+            let joined = rest.join(" ");
+            let bytes = match decode_escapes(&joined) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("invalid uart payload: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            format!("/v1/api/uart/inject-hex/{}", hex_encode(&bytes))
+        }
+        "uart-read" => {
+            raw_output = true;
+            if let Some(v) = args.next() {
+                if parse_u64(&v).is_none() {
+                    eprintln!("invalid read size: {}", v);
+                    std::process::exit(1);
+                }
+                format!("/v1/api/uart/read/{}", v)
+            } else {
+                "/v1/api/uart/read".to_string()
+            }
+        }
+        _ => {
+            eprintln!("Unknown command: {}", cmd);
+            print_usage();
+            std::process::exit(1);
+        }
+    };
+
+    let (status, body) = match http_get(addr, &path) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("request failed: {}", e);
+            std::process::exit(1);
+        }
+    };
+    if !body.is_empty() {
+        if raw_output {
+            print!("{}", body);
+        } else {
+            println!("{}", body);
+        }
+    }
+    if status >= 300 {
+        std::process::exit(1);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Usage and main
+// ---------------------------------------------------------------------------
+
+fn print_usage() {
+    eprintln!("Usage: emuko <command> [args...]");
+    eprintln!();
+    eprintln!("Commands:");
+    eprintln!("  dow [set-name]            Download kernel/initrd from registry");
+    eprintln!("  start [emukod-args...]    Start emukod daemon");
+    eprintln!("  stop                      Stop (pause) the emulator");
+    eprintln!("  con                       Continue execution");
+    eprintln!("  dump                      Print CPU state");
+    eprintln!("  step [n]                  Step N instructions (default 1)");
+    eprintln!("  disas                     Disassemble at current PC");
+    eprintln!("  snap                      Take a snapshot");
+    eprintln!("  ls                        List snapshots");
+    eprintln!("  restore <snapshot>        Restore a snapshot");
+    eprintln!("  set <register> <value>    Set register value");
+    eprintln!("  uart-inject <text>        Inject text into guest UART");
+    eprintln!("  uart-read [n]             Read from guest UART");
+    eprintln!();
+    eprintln!("Env: EMUKO_ADDR=127.0.0.1:7788");
 }
 
 fn main() {
     let mut args = env::args().skip(1);
-    let Some(path) = args.next() else {
+    let Some(cmd) = args.next() else {
         print_usage();
         std::process::exit(1);
     };
 
-    let mut max_steps: Option<u64> = None;
-    let mut load_addr: Option<u64> = None;
-    let mut entry_addr: Option<u64> = None;
-    let mut ram_base: u64 = DEFAULT_RAM_BASE;
-    let mut ram_size: usize = DEFAULT_RAM_SIZE;
-    let mut dtb_path: Option<String> = None;
-    let mut dtb_addr: Option<u64> = None;
-    let mut initrd_path: Option<String> = None;
-    let mut initrd_addr: Option<u64> = None;
-    let mut linux_boot = false;
-    let mut ext_mask: Option<u64> = None;
-    let mut bootargs: Option<String> = None;
-    let mut trace_traps: Option<u64> = None;
-    let mut trace_instr: Option<u64> = None;
-    let mut save_snapshot: Option<String> = None;
-    let mut load_snapshot: Option<String> = None;
-    let mut autosnapshot_every: Option<u64> = None;
-    let mut autosnapshot_dir: String = "/tmp/emuko".to_string();
-    let mut dump_state = true;
-    let mut tuning = RuntimeTuning::default();
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--steps" => {
-                let Some(n) = args.next() else {
-                    eprintln!("Missing value for --steps");
-                    std::process::exit(1);
-                };
-                max_steps = n.parse::<u64>().ok();
-                if max_steps.is_none() {
-                    eprintln!("Invalid --steps value: {n}");
-                    std::process::exit(1);
-                }
-            }
-            "--load-addr" => {
-                let Some(val) = args.next() else {
-                    eprintln!("Missing value for --load-addr");
-                    std::process::exit(1);
-                };
-                load_addr = parse_u64(&val);
-                if load_addr.is_none() {
-                    eprintln!("Invalid --load-addr value: {val}");
-                    std::process::exit(1);
-                }
-            }
-            "--entry-addr" => {
-                let Some(val) = args.next() else {
-                    eprintln!("Missing value for --entry-addr");
-                    std::process::exit(1);
-                };
-                entry_addr = parse_u64(&val);
-                if entry_addr.is_none() {
-                    eprintln!("Invalid --entry-addr value: {val}");
-                    std::process::exit(1);
-                }
-            }
-            "--ram-base" => {
-                let Some(val) = args.next() else {
-                    eprintln!("Missing value for --ram-base");
-                    std::process::exit(1);
-                };
-                ram_base = match parse_u64(&val) {
-                    Some(v) => v,
-                    None => {
-                        eprintln!("Invalid --ram-base value: {val}");
-                        std::process::exit(1);
-                    }
-                };
-            }
-            "--ram-size" => {
-                let Some(val) = args.next() else {
-                    eprintln!("Missing value for --ram-size");
-                    std::process::exit(1);
-                };
-                ram_size = match parse_u64(&val) {
-                    Some(v) => v as usize,
-                    None => {
-                        eprintln!("Invalid --ram-size value: {val}");
-                        std::process::exit(1);
-                    }
-                };
-            }
-            "--dtb" => {
-                let Some(val) = args.next() else {
-                    eprintln!("Missing value for --dtb");
-                    std::process::exit(1);
-                };
-                dtb_path = Some(val);
-            }
-            "--dtb-addr" => {
-                let Some(val) = args.next() else {
-                    eprintln!("Missing value for --dtb-addr");
-                    std::process::exit(1);
-                };
-                dtb_addr = parse_u64(&val);
-                if dtb_addr.is_none() {
-                    eprintln!("Invalid --dtb-addr value: {val}");
-                    std::process::exit(1);
-                }
-            }
-            "--initrd" => {
-                let Some(val) = args.next() else {
-                    eprintln!("Missing value for --initrd");
-                    std::process::exit(1);
-                };
-                initrd_path = Some(val);
-            }
-            "--initrd-addr" => {
-                let Some(val) = args.next() else {
-                    eprintln!("Missing value for --initrd-addr");
-                    std::process::exit(1);
-                };
-                initrd_addr = parse_u64(&val);
-                if initrd_addr.is_none() {
-                    eprintln!("Invalid --initrd-addr value: {val}");
-                    std::process::exit(1);
-                }
-            }
-            "--linux" => {
-                linux_boot = true;
-            }
-            "--ext" => {
-                let Some(val) = args.next() else {
-                    eprintln!("Missing value for --ext");
-                    std::process::exit(1);
-                };
-                ext_mask = ext_mask_from_str(&val);
-                if ext_mask.is_none() {
-                    eprintln!("Invalid --ext value: {val}");
-                    std::process::exit(1);
-                }
-            }
-            "--bootargs" => {
-                let Some(val) = args.next() else {
-                    eprintln!("Missing value for --bootargs");
-                    std::process::exit(1);
-                };
-                bootargs = Some(val);
-            }
-            "--trace-traps" => {
-                let Some(val) = args.next() else {
-                    eprintln!("Missing value for --trace-traps");
-                    std::process::exit(1);
-                };
-                trace_traps = parse_u64(&val);
-                if trace_traps.is_none() {
-                    eprintln!("Invalid --trace-traps value: {val}");
-                    std::process::exit(1);
-                }
-            }
-            "--trace-instr" => {
-                let Some(val) = args.next() else {
-                    eprintln!("Missing value for --trace-instr");
-                    std::process::exit(1);
-                };
-                trace_instr = parse_u64(&val);
-                if trace_instr.is_none() {
-                    eprintln!("Invalid --trace-instr value: {val}");
-                    std::process::exit(1);
-                }
-            }
-            "--save-snapshot" => {
-                let Some(val) = args.next() else {
-                    eprintln!("Missing value for --save-snapshot");
-                    std::process::exit(1);
-                };
-                save_snapshot = Some(val);
-            }
-            "--load-snapshot" => {
-                let Some(val) = args.next() else {
-                    eprintln!("Missing value for --load-snapshot");
-                    std::process::exit(1);
-                };
-                load_snapshot = Some(val);
-            }
-            "--autosnapshot-every" => {
-                let Some(val) = args.next() else {
-                    eprintln!("Missing value for --autosnapshot-every");
-                    std::process::exit(1);
-                };
-                autosnapshot_every = parse_u64(&val);
-                if autosnapshot_every.is_none() {
-                    eprintln!("Invalid --autosnapshot-every value: {val}");
-                    std::process::exit(1);
-                }
-            }
-            "--autosnapshot-dir" => {
-                let Some(val) = args.next() else {
-                    eprintln!("Missing value for --autosnapshot-dir");
-                    std::process::exit(1);
-                };
-                autosnapshot_dir = val;
-            }
-            "--perf-report-count" => {
-                let Some(val) = args.next() else {
-                    eprintln!("Missing value for --perf-report-count");
-                    std::process::exit(1);
-                };
-                tuning.perf_report_count = parse_u64(&val).and_then(|v| u32::try_from(v).ok());
-                if tuning.perf_report_count.is_none() {
-                    eprintln!("Invalid --perf-report-count value: {val}");
-                    std::process::exit(1);
-                }
-            }
-            "--perf-report-secs" => {
-                let Some(val) = args.next() else {
-                    eprintln!("Missing value for --perf-report-secs");
-                    std::process::exit(1);
-                };
-                tuning.perf_report_secs = parse_f64(&val);
-                if tuning.perf_report_secs.is_none()
-                    || tuning.perf_report_secs.unwrap_or(0.0) <= 0.0
-                {
-                    eprintln!("Invalid --perf-report-secs value: {val}");
-                    std::process::exit(1);
-                }
-            }
-            "--perf-check-ticks" => {
-                let Some(val) = args.next() else {
-                    eprintln!("Missing value for --perf-check-ticks");
-                    std::process::exit(1);
-                };
-                tuning.perf_check_ticks = parse_u64(&val).and_then(|v| u32::try_from(v).ok());
-                if tuning.perf_check_ticks.unwrap_or(0) == 0 {
-                    eprintln!("Invalid --perf-check-ticks value: {val}");
-                    std::process::exit(1);
-                }
-            }
-            "--uart-poll-wall-ms" => {
-                let Some(val) = args.next() else {
-                    eprintln!("Missing value for --uart-poll-wall-ms");
-                    std::process::exit(1);
-                };
-                tuning.uart_poll_wall_ms = parse_u64(&val);
-                if tuning.uart_poll_wall_ms.unwrap_or(0) == 0 {
-                    eprintln!("Invalid --uart-poll-wall-ms value: {val}");
-                    std::process::exit(1);
-                }
-            }
-            "--uart-poll-calib-ms" => {
-                let Some(val) = args.next() else {
-                    eprintln!("Missing value for --uart-poll-calib-ms");
-                    std::process::exit(1);
-                };
-                tuning.uart_poll_calib_ms = parse_u64(&val);
-                if tuning.uart_poll_calib_ms.unwrap_or(0) == 0 {
-                    eprintln!("Invalid --uart-poll-calib-ms value: {val}");
-                    std::process::exit(1);
-                }
-            }
-            "--uart-poll-check-ticks" => {
-                let Some(val) = args.next() else {
-                    eprintln!("Missing value for --uart-poll-check-ticks");
-                    std::process::exit(1);
-                };
-                tuning.uart_poll_check_ticks = parse_u64(&val).and_then(|v| u32::try_from(v).ok());
-                if tuning.uart_poll_check_ticks.unwrap_or(0) == 0 {
-                    eprintln!("Invalid --uart-poll-check-ticks value: {val}");
-                    std::process::exit(1);
-                }
-            }
-            "--uart-poll-ticks" => {
-                let Some(val) = args.next() else {
-                    eprintln!("Missing value for --uart-poll-ticks");
-                    std::process::exit(1);
-                };
-                tuning.uart_poll_ticks = parse_u64(&val).and_then(|v| u32::try_from(v).ok());
-                if tuning.uart_poll_ticks.unwrap_or(0) == 0 {
-                    eprintln!("Invalid --uart-poll-ticks value: {val}");
-                    std::process::exit(1);
-                }
-            }
-            "--uart-flush-every" => {
-                let Some(val) = args.next() else {
-                    eprintln!("Missing value for --uart-flush-every");
-                    std::process::exit(1);
-                };
-                tuning.uart_flush_every = parse_u64(&val).and_then(|v| usize::try_from(v).ok());
-                if tuning.uart_flush_every.unwrap_or(0) == 0 {
-                    eprintln!("Invalid --uart-flush-every value: {val}");
-                    std::process::exit(1);
-                }
-            }
-            "--no-dump" => {
-                dump_state = false;
-            }
-            _ => {
-                eprintln!("Unknown argument: {arg}");
-                print_usage();
-                std::process::exit(1);
-            }
-        }
+    if cmd == "dow" {
+        let filter = args.next();
+        run_dow(filter.as_deref());
+        return;
     }
 
-    if !Path::new(&autosnapshot_dir).is_absolute() {
-        eprintln!(
-            "--autosnapshot-dir must be an absolute path: {}",
-            autosnapshot_dir
-        );
-        std::process::exit(1);
+    let addr = env::var("EMUKO_ADDR").unwrap_or_else(|_| "127.0.0.1:7788".to_string());
+
+    if cmd == "start" {
+        let remaining: Vec<String> = args.collect();
+        run_start(&remaining, &addr);
+        return;
     }
 
-    if let Some(load_path) = load_snapshot.as_deref() {
-        let mut system = match System::load_snapshot(load_path) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("Failed to load snapshot {}: {}", load_path, e);
-                std::process::exit(1);
-            }
-        };
-        if trace_traps.is_some() {
-            system.set_trace_traps(trace_traps);
-        }
-        if trace_instr.is_some() {
-            system.set_trace_instr(trace_instr);
-        }
-        if let Err(e) = tuning.apply(&mut system) {
-            eprintln!("Failed to apply runtime tuning: {}", e);
-            std::process::exit(1);
-        }
-        let mut exit_code = 0;
-        let result = run_with_autosnapshot(
-            &mut system,
-            max_steps,
-            autosnapshot_every,
-            &autosnapshot_dir,
-        );
-        let ran = true;
-        match result {
-            Ok(steps) => {
-                println!("Completed {} steps (total {})", steps, system.total_steps());
-            }
-            Err(RunFailure::Trap(trap)) => {
-                exit_code = 2;
-                print_trap(trap);
-            }
-            Err(RunFailure::Snapshot(err)) => {
-                exit_code = 1;
-                eprintln!("{}", err);
-            }
-        }
-        if let Some(save_path) = save_snapshot.as_deref() {
-            if let Err(e) = system.save_snapshot(save_path) {
-                eprintln!("Failed to save snapshot {}: {}", save_path, e);
-                if exit_code == 0 {
-                    exit_code = 1;
-                }
-            } else {
-                println!("Saved snapshot {}", save_path);
-            }
-        }
-        if dump_state {
-            if ran {
-                system.dump_state(0);
-                system.dump_bus_stats();
-                system.dump_sbi_stats();
-                system.dump_hotpcs();
-            } else {
-                system.dump_state(0);
-                system.dump_bus_stats();
-                system.dump_sbi_stats();
-                system.dump_hotpcs();
-            }
-        } else if ran {
-            if let Some(hart0) = system.harts.get(0) {
-                println!(
-                    "final hart0: pc=0x{:016x} ra=0x{:016x} sp=0x{:016x} a0=0x{:016x} a1=0x{:016x} a2=0x{:016x} a6=0x{:016x} a7=0x{:016x}",
-                    hart0.pc,
-                    hart0.regs[1],
-                    hart0.regs[2],
-                    hart0.regs[10],
-                    hart0.regs[11],
-                    hart0.regs[12],
-                    hart0.regs[16],
-                    hart0.regs[17]
-                );
-            }
-            system.dump_bus_stats();
-            system.dump_sbi_stats();
-            system.dump_hotpcs();
-        }
-        std::process::exit(exit_code);
-    }
-
-    let data = match fs::read(&path) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("Failed to read {}: {e}", path);
-            std::process::exit(1);
-        }
-    };
-
-    let pe_image = pe::parse_pe(&data).ok();
-    if pe_image.is_none() && data.len() > ram_size {
-        eprintln!(
-            "Program too large: {} bytes (ram {} bytes)",
-            data.len(),
-            ram_size
-        );
-        std::process::exit(1);
-    }
-
-    let default_ext = (1u64 << 8)
-        | (1u64 << 12)
-        | (1u64 << 0)
-        | (1u64 << 2)
-        | (1u64 << 5)
-        | (1u64 << 3)
-        | (1u64 << 18)
-        | (1u64 << 20);
-    let ext_mask = ext_mask.unwrap_or(default_ext);
-    let mut system = System::new(1, ram_base, ram_size, ext_mask);
-    system.set_trace_traps(trace_traps);
-    system.set_trace_instr(trace_instr);
-    if let Err(e) = tuning.apply(&mut system) {
-        eprintln!("Failed to apply runtime tuning: {}", e);
-        std::process::exit(1);
-    }
-    let load_addr_arg = load_addr;
-    let mut load_addr = load_addr_arg.unwrap_or(ram_base);
-    let mut image_size = data.len() as u64;
-    let mut entry_addr_default = load_addr;
-    if let Some(pe) = &pe_image {
-        if std::env::var("PE_TRACE").ok().is_some() {
-            eprintln!(
-                "PE: image_base=0x{:x} entry_rva=0x{:x} size_of_image=0x{:x} sections={}",
-                pe.image_base,
-                pe.entry_rva,
-                pe.size_of_image,
-                pe.sections.len()
-            );
-        }
-        let preferred = if pe.image_base == 0 {
-            ram_base
-        } else {
-            pe.image_base
-        };
-        load_addr = load_addr_arg.unwrap_or(preferred);
-        image_size = pe.size_of_image as u64;
-        entry_addr_default = load_addr + pe.entry_rva as u64;
-    }
-    if load_addr < ram_base || load_addr + image_size > ram_base + ram_size as u64 {
-        eprintln!(
-            "Image does not fit in RAM at 0x{:016x} (size 0x{:x})",
-            load_addr, image_size
-        );
-        std::process::exit(1);
-    }
-    let entry_addr = entry_addr.unwrap_or(entry_addr_default);
-    system.set_reset_pc(entry_addr);
-    system.reset();
-
-    let mut exit_code = 0;
-    let mut ran = false;
-
-    let kernel_end = load_addr + image_size;
-    let mut kernel_data_start: Option<u64> = None;
-    if let Some(pe) = &pe_image {
-        for sec in &pe.sections {
-            if sec.vsize == 0 && sec.raw_size == 0 {
-                continue;
-            }
-            if sec.is_executable() {
-                continue;
-            }
-            let start = load_addr + sec.vaddr;
-            kernel_data_start = Some(kernel_data_start.map_or(start, |cur| cur.min(start)));
-        }
-    }
-    let mut load_ok = true;
-    if let Some(pe) = &pe_image {
-        if load_addr != pe.image_base && pe.base_reloc_size == 0 {
-            eprintln!(
-                "Warning: PE has no relocations; load_addr 0x{:x} differs from image base 0x{:x}",
-                load_addr, pe.image_base
-            );
-        }
-        for sec in &pe.sections {
-            if sec.raw_size == 0 && sec.vsize == 0 {
-                continue;
-            }
-            let vaddr = load_addr + sec.vaddr;
-            if sec.raw_size > 0 {
-                let start = sec.raw_ptr as usize;
-                let end = start.saturating_add(sec.raw_size as usize).min(data.len());
-                if let Err(e) = system.load(vaddr, &data[start..end]) {
-                    eprintln!("PE load failed: {:?}", e);
-                    load_ok = false;
-                    break;
-                }
-            }
-            if sec.vsize > sec.raw_size {
-                let zero_len = (sec.vsize - sec.raw_size) as usize;
-                let zeros = vec![0u8; zero_len.min(1024 * 1024)];
-                let mut offset = 0usize;
-                while offset < zero_len {
-                    let chunk = (zero_len - offset).min(zeros.len());
-                    if let Err(e) =
-                        system.load(vaddr + sec.raw_size as u64 + offset as u64, &zeros[..chunk])
-                    {
-                        eprintln!("PE BSS load failed: {:?}", e);
-                        load_ok = false;
-                        break;
-                    }
-                    offset += chunk;
-                }
-                if !load_ok {
-                    break;
-                }
-            }
-        }
-    } else {
-        if let Err(e) = system.load(load_addr, &data) {
-            eprintln!("Load failed: {:?}", e);
-            load_ok = false;
-        }
-    }
-
-    if load_ok {
-        if let Some(pe) = &pe_image {
-            if load_addr != pe.image_base && pe.base_reloc_size != 0 {
-                let delta = load_addr.wrapping_sub(pe.image_base);
-                let mut rva = pe.base_reloc_rva as u64;
-                let end = pe.base_reloc_rva as u64 + pe.base_reloc_size as u64;
-                while rva < end {
-                    let file_off = match pe.rva_to_file_offset(rva as u32) {
-                        Some(off) => off,
-                        None => break,
-                    };
-                    if file_off + 8 > data.len() {
-                        break;
-                    }
-                    let page_rva = u32::from_le_bytes([
-                        data[file_off],
-                        data[file_off + 1],
-                        data[file_off + 2],
-                        data[file_off + 3],
-                    ]);
-                    let block_size = u32::from_le_bytes([
-                        data[file_off + 4],
-                        data[file_off + 5],
-                        data[file_off + 6],
-                        data[file_off + 7],
-                    ]);
-                    if block_size < 8 {
-                        break;
-                    }
-                    let entries = (block_size - 8) / 2;
-                    for i in 0..entries {
-                        let entry_off = file_off + 8 + (i as usize) * 2;
-                        if entry_off + 2 > data.len() {
-                            break;
-                        }
-                        let entry = u16::from_le_bytes([data[entry_off], data[entry_off + 1]]);
-                        let rtype = entry >> 12;
-                        let roff = (entry & 0x0fff) as u64;
-                        if rtype == 0 {
-                            continue;
-                        }
-                        let reloc_addr = load_addr + page_rva as u64 + roff;
-                        match rtype {
-                            0xA => {
-                                if let Ok(val) = system.bus.read_u64(
-                                    0,
-                                    reloc_addr,
-                                    crate::bus::AccessType::Debug,
-                                ) {
-                                    let _ = system.bus.write_u64(
-                                        0,
-                                        reloc_addr,
-                                        val.wrapping_add(delta),
-                                        crate::bus::AccessType::Debug,
-                                    );
-                                }
-                            }
-                            0x3 => {
-                                if let Ok(val) = system.bus.read_u32(
-                                    0,
-                                    reloc_addr,
-                                    crate::bus::AccessType::Debug,
-                                ) {
-                                    let _ = system.bus.write_u32(
-                                        0,
-                                        reloc_addr,
-                                        val.wrapping_add(delta as u32),
-                                        crate::bus::AccessType::Debug,
-                                    );
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    rva = rva.wrapping_add(block_size as u64);
-                }
-            }
-        }
-
-        let initrd_data = if let Some(path) = initrd_path {
-            match fs::read(&path) {
-                Ok(d) => Some(d),
-                Err(e) => {
-                    eprintln!("Failed to read initrd {}: {e}", path);
-                    std::process::exit(1);
-                }
-            }
-        } else {
-            None
-        };
-
-        let mut initrd_range: Option<(u64, u64)> = None;
-        if let Some(initrd) = &initrd_data {
-            let top = ram_base + ram_size as u64;
-            let size = align_up(initrd.len() as u64, 0x1000);
-            let desired =
-                initrd_addr.unwrap_or_else(|| align_down(top.saturating_sub(size), 0x1000));
-            let end = desired + initrd.len() as u64;
-            if desired < ram_base || end > ram_base + ram_size as u64 {
-                eprintln!("Initrd does not fit in RAM at 0x{:016x}", desired);
-                std::process::exit(1);
-            }
-            if !(end <= load_addr || desired >= kernel_end) {
-                eprintln!("Initrd overlaps kernel image");
-                std::process::exit(1);
-            }
-            if let Err(e) = system.load(desired, initrd) {
-                eprintln!("Initrd load failed: {:?}", e);
-                std::process::exit(1);
-            }
-            initrd_range = Some((desired, desired + initrd.len() as u64));
-        }
-
-        let dtb_data = if let Some(path) = dtb_path {
-            match fs::read(&path) {
-                Ok(d) => Some(d),
-                Err(e) => {
-                    eprintln!("Failed to read dtb {}: {e}", path);
-                    std::process::exit(1);
-                }
-            }
-        } else if linux_boot {
-            let isa = isa_string_from_mask(ext_mask);
-            Some(fdt::build_virt_dtb(
-                1,
-                ram_base,
-                ram_size as u64,
-                &isa,
-                bootargs.as_deref(),
-                initrd_range,
-            ))
-        } else {
-            None
-        };
-        if let Ok(path) = std::env::var("DUMP_DTB") {
-            if let Some(dtb) = &dtb_data {
-                if let Err(e) = fs::write(&path, dtb) {
-                    eprintln!("Failed to write dtb {}: {e}", path);
-                } else {
-                    eprintln!("Wrote dtb to {}", path);
-                }
-            }
-        }
-
-        let mut dtb_load_addr = 0u64;
-        if let Some(dtb) = &dtb_data {
-            let desired = dtb_addr.unwrap_or_else(|| {
-                let top = initrd_range
-                    .map(|(start, _)| start)
-                    .unwrap_or(ram_base + ram_size as u64);
-                let size = align_up(dtb.len() as u64, 0x1000);
-                align_down(top.saturating_sub(size), 0x1000)
-            });
-            let dtb_end = desired + dtb.len() as u64;
-            let kernel_end = load_addr + image_size;
-            if let Some((initrd_start, initrd_end)) = initrd_range {
-                if !(dtb_end <= initrd_start || desired >= initrd_end) {
-                    eprintln!("DTB overlaps initrd");
-                    std::process::exit(1);
-                }
-            }
-            if desired < ram_base || dtb_end > ram_base + ram_size as u64 {
-                eprintln!("DTB does not fit in RAM at 0x{:016x}", desired);
-                std::process::exit(1);
-            }
-            if !(dtb_end <= load_addr || desired >= kernel_end) {
-                eprintln!("DTB overlaps kernel image");
-                std::process::exit(1);
-            }
-            if let Err(e) = system.load(desired, dtb) {
-                eprintln!("DTB load failed: {:?}", e);
-                std::process::exit(1);
-            }
-            dtb_load_addr = desired;
-        }
-
-        if linux_boot {
-            if dtb_load_addr == 0 {
-                eprintln!("--linux requires --dtb or auto-generated DTB");
-                std::process::exit(1);
-            }
-            if pe_image.is_some() {
-                let dtb_len = dtb_data.as_ref().map(|d| d.len()).unwrap_or(0);
-                let dtb_range = if dtb_len == 0 {
-                    None
-                } else {
-                    Some((dtb_load_addr, dtb_load_addr + dtb_len as u64))
-                };
-                let mut top = ram_base + ram_size as u64;
-                if let Some((initrd_start, _)) = initrd_range {
-                    top = top.min(initrd_start);
-                }
-                if dtb_load_addr != 0 {
-                    top = top.min(dtb_load_addr);
-                }
-                let efi_size = efi::EFI_REGION_SIZE;
-                let efi_base = align_down(top.saturating_sub(efi_size), 0x1000);
-                if efi_base < ram_base || efi_base + efi_size > top {
-                    eprintln!("EFI tables do not fit in RAM");
-                    std::process::exit(1);
-                }
-                if !(efi_base + efi_size <= load_addr || efi_base >= kernel_end) {
-                    eprintln!("EFI tables overlap kernel image");
-                    std::process::exit(1);
-                }
-                let alloc_bottom = align_up(kernel_end, 0x1000);
-                let alloc_top = efi_base;
-                if alloc_bottom >= alloc_top {
-                    eprintln!("EFI allocator region is empty");
-                    std::process::exit(1);
-                }
-                let kernel_data_start_efi = if std::env::var("EFI_SPLIT_KERNEL_MAP").is_ok() {
-                    kernel_data_start
-                } else {
-                    None
-                };
-                let efi_build = efi::build_efi_blob(
-                    efi_base,
-                    ram_base,
-                    ram_size as u64,
-                    (load_addr, kernel_end),
-                    kernel_data_start_efi,
-                    bootargs.as_deref(),
-                    initrd_range,
-                    dtb_range,
-                    alloc_bottom,
-                    alloc_top,
-                );
-                if std::env::var("EFI_PROTO_TRACE").is_ok() {
-                    let off = (efi_build.riscv_boot_proto - efi_base) as usize;
-                    if off + 16 <= efi_build.blob.len() {
-                        eprintln!(
-                            "EFI boot proto bytes: {:02x?}",
-                            &efi_build.blob[off..off + 16]
-                        );
-                    }
-                    let off = (efi_build.riscv_fdt_proto - efi_base) as usize;
-                    if off + 16 <= efi_build.blob.len() {
-                        eprintln!(
-                            "EFI fdt proto bytes: {:02x?}",
-                            &efi_build.blob[off..off + 16]
-                        );
-                    }
-                }
-                eprintln!(
-                    "EFI: base=0x{:016x} system_table=0x{:016x} image_handle=0x{:016x} alloc=[0x{:016x}..0x{:016x})",
-                    efi_base,
-                    efi_build.system_table,
-                    efi_build.image_handle,
-                    alloc_bottom,
-                    alloc_top
-                );
-                if let Err(e) = system.load(efi_base, &efi_build.blob) {
-                    eprintln!("EFI tables load failed: {:?}", e);
-                    std::process::exit(1);
-                }
-                let system_table = efi_build.system_table;
-                let image_handle = efi_build.image_handle;
-                let efi_state = efi::EfiState::new(efi_build);
-                system.configure_efi_boot(system_table, image_handle, efi_state);
-            } else {
-                system.configure_linux_boot(dtb_load_addr);
-            }
-        }
-        let result = run_with_autosnapshot(
-            &mut system,
-            max_steps,
-            autosnapshot_every,
-            &autosnapshot_dir,
-        );
-        ran = true;
-        match result {
-            Ok(steps) => {
-                println!("Completed {} steps (total {})", steps, system.total_steps());
-            }
-            Err(RunFailure::Trap(trap)) => {
-                exit_code = 2;
-                print_trap(trap);
-            }
-            Err(RunFailure::Snapshot(err)) => {
-                exit_code = 1;
-                eprintln!("{}", err);
-            }
-        }
-    } else {
-        exit_code = 1;
-    }
-
-    if let Some(save_path) = save_snapshot.as_deref() {
-        if let Err(e) = system.save_snapshot(save_path) {
-            eprintln!("Failed to save snapshot {}: {}", save_path, e);
-            if exit_code == 0 {
-                exit_code = 1;
-            }
-        } else {
-            println!("Saved snapshot {}", save_path);
-        }
-    }
-
-    if dump_state {
-        if ran {
-            system.dump_state(data.len());
-            system.dump_bus_stats();
-            system.dump_sbi_stats();
-            system.dump_hotpcs();
-        } else {
-            system.dump_state(0);
-            system.dump_bus_stats();
-            system.dump_sbi_stats();
-            system.dump_hotpcs();
-        }
-    } else if ran {
-        if let Some(hart0) = system.harts.get(0) {
-            println!(
-                "final hart0: pc=0x{:016x} ra=0x{:016x} sp=0x{:016x} a0=0x{:016x} a1=0x{:016x} a2=0x{:016x} a6=0x{:016x} a7=0x{:016x}",
-                hart0.pc,
-                hart0.regs[1],
-                hart0.regs[2],
-                hart0.regs[10],
-                hart0.regs[11],
-                hart0.regs[12],
-                hart0.regs[16],
-                hart0.regs[17]
-            );
-        }
-        system.dump_bus_stats();
-        system.dump_sbi_stats();
-        system.dump_hotpcs();
-    }
-    std::process::exit(exit_code);
+    run_ctl(&cmd, &mut args, &addr);
 }

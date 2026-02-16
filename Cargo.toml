@@ -12,24 +12,12 @@ name = "emuko"
 path = "src/main.rs"
 
 [[bin]]
-name = "emuko-sim"
-path = "src/bin/emuko_sim.rs"
-
-[[bin]]
 name = "emukod"
 path = "src/bin/emukod.rs"
 
 [[bin]]
-name = "emuko-ctl"
-path = "src/bin/emuko_ctl.rs"
-
-[[bin]]
-name = "emu"
-path = "src/bin/emu.rs"
-
-[[bin]]
-name = "emuko-jitdiff"
-path = "src/bin/emuko_jitdiff.rs"
+name = "emuko-debug-jitdiff"
+path = "src/bin/emuko_debug_jitdiff.rs"
 
 [profile.release]
 codegen-units = 1

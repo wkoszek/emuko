@@ -22,18 +22,19 @@ cargo build --release
 ```
 
 Binaries are placed in `target/release/`:
-- `emuko` — standalone emulator
-- `emukod` — daemon with HTTP API
-- `emu` — client for the daemon
-- `emuko-jitdiff` — JIT correctness checker
+- `emuko` — CLI: download, daemon control (`start`, `stop`, `dump`, `step`, `con`, `uart`, etc.)
+- `emukod` — daemon with HTTP API + standalone emulator (debug mode)
+- `emuko-debug-jitdiff` — JIT correctness checker
 
 ## Quick Start
 
-### Boot Linux (standalone)
+### Download a kernel
 
 ```
-./runlinux.sh <kernel> <initrd>
+emuko dow
 ```
+
+This downloads the Debian RISC-V netboot kernel and initrd to `~/.emuko/riscv64/debian-netboot/` with SHA256 verification.
 
 ### Boot Linux (interactive daemon)
 
@@ -41,33 +42,36 @@ Binaries are placed in `target/release/`:
 ./runlinux_interactive.sh --kernel <kernel> --initrd <initrd>
 ```
 
-The daemon exposes an HTTP API at `http://127.0.0.1:7788/v1/api/` with endpoints: `start`, `stop`, `dump`, `step`, `continue`, `set`, `uart`.
-
-Use `emu` to interact:
+Or start the daemon directly and control it with `emuko`:
 
 ```
-emu con          # continue execution
-emu stop         # pause
-emu dump         # print CPU state
-emu step 1000    # step N instructions
-emu uart "ls"    # inject command into guest shell
+emukod --kernel <kernel> --initrd <initrd> --autostart &
+emuko dump             # print CPU state
+emuko con              # continue execution
+emuko stop             # pause
+emuko step 1000        # step N instructions
+emuko uart-inject "ls" # inject command into guest UART
+emuko snap             # take a snapshot
+emuko ls               # list snapshots
 ```
+
+The daemon exposes an HTTP API at `http://127.0.0.1:7788/v1/api/` with endpoints: `start`, `stop`, `dump`, `step`, `continue`, `set`, `snap`, `ls`, `restore`, `uart`.
 
 ### Run a bare-metal binary
 
 ```
-cargo run --release --bin emuko -- program.bin --steps 10000
+emukod program.bin --steps 10000
 ```
 
 ### Snapshots
 
 ```
 # Save
-cargo run --release --bin emuko -- <kernel> --linux --initrd <initrd> \
+emukod <kernel> --linux --initrd <initrd> \
   --save-snapshot state.emuko.zst --steps 5000000
 
 # Restore
-cargo run --release --bin emuko -- <kernel> --linux --initrd <initrd> \
+emukod <kernel> --linux --initrd <initrd> \
   --load-snapshot state.emuko.zst
 ```
 
@@ -86,13 +90,10 @@ Options can be set via CLI flags, environment variables, or `emuko.yml`:
 
 ## Getting a Kernel
 
-Use [DQIB (Debian Quick Image Baker)](https://people.debian.org/~gio/dqib/) pre-built RISC-V images, or the Debian netboot installer:
+Use `emuko dow` (see Quick Start above) or grab pre-built images from [DQIB (Debian Quick Image Baker)](https://people.debian.org/~gio/dqib/). To download a specific set:
 
 ```
-mkdir -p artifacts/debian-netboot && cd artifacts/debian-netboot
-wget http://ftp.debian.org/debian/dists/sid/main/installer-riscv64/current/images/netboot/vmlinuz
-wget http://ftp.debian.org/debian/dists/sid/main/installer-riscv64/current/images/netboot/initrd.gz
-mv vmlinuz linux
+emuko dow debian-netboot
 ```
 
 ## License
