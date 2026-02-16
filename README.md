@@ -28,6 +28,7 @@ The main binary is `target/release/emuko`.
 ### 1. Download a kernel
 
 ```
+alias emuko=target/release/emuko
 emuko dow
 ```
 
@@ -36,8 +37,7 @@ Downloads the Debian RISC-V netboot kernel and initrd to `~/.emuko/` with SHA256
 ### 2. Boot Linux
 
 ```
-emuko start ~/.emuko/riscv64/debian-netboot/linux \
-            ~/.emuko/riscv64/debian-netboot/initrd.gz --autostart
+emuko start
 ```
 
 This starts the emulator daemon and attaches an interactive console. You'll see the kernel boot and get a shell prompt. Keyboard shortcuts:
