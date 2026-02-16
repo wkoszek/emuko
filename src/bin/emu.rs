@@ -9,10 +9,10 @@ fn target_bin(name: &str) -> Result<PathBuf, String> {
 }
 
 fn main() {
-    let target = match target_bin("korisc") {
+    let target = match target_bin("emuko-ctl") {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("failed to locate korisc: {}", e);
+            eprintln!("failed to locate emuko-ctl: {}", e);
             std::process::exit(1);
         }
     };
@@ -20,7 +20,7 @@ fn main() {
     match status {
         Ok(s) => std::process::exit(s.code().unwrap_or(1)),
         Err(e) => {
-            eprintln!("failed to exec korisc: {}", e);
+            eprintln!("failed to exec emuko-ctl: {}", e);
             std::process::exit(1);
         }
     }

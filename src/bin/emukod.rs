@@ -43,7 +43,7 @@ use std::time::Duration;
 
 use system::System;
 
-const NAME: &str = "KoRISCV";
+const NAME: &str = "emuko";
 
 #[derive(Clone, Debug)]
 struct DaemonOpts {
@@ -109,7 +109,7 @@ enum RegTarget {
 
 fn print_usage_and_exit() -> ! {
     eprintln!(
-        "Usage: koriscvd [--config FILE] [--snapshot FILE] [--kernel FILE] [--initrd FILE] [<kernel> <initrd>] [--ram-size BYTES] [--bootargs STR] [--addr HOST:PORT] [--snapshot-dir DIR] [--chunk-steps N] [--autostart] [--backend adaptive|arm64_jit|amd64_jit|arm64|x86_64]\n\
+        "Usage: emukod [--config FILE] [--snapshot FILE] [--kernel FILE] [--initrd FILE] [<kernel> <initrd>] [--ram-size BYTES] [--bootargs STR] [--addr HOST:PORT] [--snapshot-dir DIR] [--chunk-steps N] [--autostart] [--backend adaptive|arm64_jit|amd64_jit|arm64|x86_64]\n\
 Precedence: config file < command switch < environment variable"
     );
     std::process::exit(1);
@@ -153,7 +153,7 @@ fn unquote_yaml(v: &str) -> String {
     }
 }
 
-fn parse_korisc_yaml(path: &Path) -> Result<DaemonConfigFile, String> {
+fn parse_emuko_yaml(path: &Path) -> Result<DaemonConfigFile, String> {
     let content = fs::read_to_string(path).map_err(|e| e.to_string())?;
     let mut cfg = DaemonConfigFile::default();
     for raw in content.lines() {
@@ -174,7 +174,7 @@ fn parse_korisc_yaml(path: &Path) -> Result<DaemonConfigFile, String> {
             "dqib_dir" => cfg.dqib_dir = clean_opt(Some(val)),
             "ram_size" => cfg.ram_size = parse_u64(&val),
             "bootargs" => cfg.bootargs = clean_opt(Some(val)),
-            "kor_addr" | "addr" => cfg.addr = clean_opt(Some(val)),
+            "emuko_addr" | "kor_addr" | "addr" => cfg.addr = clean_opt(Some(val)),
             "autosnapshot_dir" | "snapshot_dir" => cfg.snapshot_dir = clean_opt(Some(val)),
             "chunk_steps" => cfg.chunk_steps = parse_u64(&val),
             "autostart" => cfg.autostart = parse_bool_text(&val),
@@ -306,18 +306,18 @@ fn parse_opts() -> DaemonOpts {
         cli.initrd = Some(positionals[1].clone());
     }
 
-    let mut cfg_path = "korisc.yml".to_string();
+    let mut cfg_path = "emuko.yml".to_string();
     if let Some(v) = clean_opt(cli.config.clone()) {
         cfg_path = v;
     }
-    if let Ok(v) = env::var("KOR_CONFIG") {
+    if let Ok(v) = env::var("EMUKO_CONFIG") {
         if !v.trim().is_empty() {
             cfg_path = v;
         }
     }
-    let cfg_requested = cli.config.is_some() || env::var("KOR_CONFIG").is_ok();
+    let cfg_requested = cli.config.is_some() || env::var("EMUKO_CONFIG").is_ok();
     let cfg = if Path::new(&cfg_path).exists() {
-        match parse_korisc_yaml(Path::new(&cfg_path)) {
+        match parse_emuko_yaml(Path::new(&cfg_path)) {
             Ok(v) => Some(v),
             Err(e) => {
                 eprintln!("Failed to parse config {}: {}", cfg_path, e);
@@ -350,7 +350,7 @@ fn parse_opts() -> DaemonOpts {
     let dqib_dir = env::var("DQIB_DIR")
         .ok()
         .or_else(|| cfg.as_ref().and_then(|c| c.dqib_dir.clone()))
-        .unwrap_or_else(|| "/Users/wkoszek/Downloads/koriscv/dqib_riscv64-virt".to_string());
+        .unwrap_or_else(|| "/Users/wkoszek/Downloads/emuko/dqib_riscv64-virt".to_string());
 
     let mut default_kernel = format!("{}/kernel", dqib_dir);
     let mut default_initrd = format!("{}/initrd", dqib_dir);
@@ -388,14 +388,14 @@ fn parse_opts() -> DaemonOpts {
         .unwrap_or_else(|| {
             "console=ttyS0,115200 earlycon=uart8250,mmio,0x10000000 rdinit=/bin/sh".to_string()
         });
-    let addr = clean_opt(env::var("KOR_ADDR").ok())
+    let addr = clean_opt(env::var("EMUKO_ADDR").ok())
         .or_else(|| clean_opt(cli.addr))
         .or_else(|| clean_opt(cfg_addr))
         .unwrap_or_else(|| "127.0.0.1:7788".to_string());
     let snapshot_dir = clean_opt(env::var("AUTOSNAPSHOT_DIR").ok())
         .or_else(|| clean_opt(cli.snapshot_dir))
         .or_else(|| clean_opt(cfg_snapshot_dir))
-        .unwrap_or_else(|| "/tmp/korisc5".to_string());
+        .unwrap_or_else(|| "/tmp/emuko".to_string());
     let chunk_steps = env::var("CHUNK_STEPS")
         .ok()
         .and_then(|v| parse_u64(&v))
@@ -431,7 +431,7 @@ fn parse_opts() -> DaemonOpts {
 
     if snapshot.is_none() {
         if kernel.is_none() || initrd.is_none() {
-            eprintln!("Need either --snapshot FILE or kernel/initrd (from args or korisc.yml)");
+            eprintln!("Need either --snapshot FILE or kernel/initrd (from args or emuko.yml)");
             print_usage_and_exit();
         }
         if let Some(k) = &kernel {
@@ -470,11 +470,11 @@ fn parse_opts() -> DaemonOpts {
 }
 
 fn current_sim_bin() -> Option<PathBuf> {
-    if let Ok(v) = env::var("KORISCV_SIM_BIN") {
+    if let Ok(v) = env::var("EMUKO_SIM_BIN") {
         return Some(PathBuf::from(v));
     }
     let exe = env::current_exe().ok()?;
-    for name in ["koriscv", "riscv_sim"] {
+    for name in ["emuko", "emuko-sim"] {
         let mut p = exe.clone();
         p.set_file_name(name);
         if p.exists() {
@@ -495,7 +495,7 @@ fn materialize_boot_snapshot(opts: &DaemonOpts) -> Result<String, String> {
         .ok_or_else(|| "initrd path missing".to_string())?;
     let dir = Path::new(&opts.snapshot_dir);
     fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    let out = dir.join("boot-initial.kriscv.zst");
+    let out = dir.join("boot-initial.emuko.zst");
 
     let sim_args = vec![
         kernel.clone(),
@@ -518,7 +518,7 @@ fn materialize_boot_snapshot(opts: &DaemonOpts) -> Result<String, String> {
             "run".to_string(),
             "--release".to_string(),
             "--bin".to_string(),
-            "koriscv".to_string(),
+            "emuko".to_string(),
             "--".to_string(),
         ];
         cargo_args.extend(sim_args.iter().cloned());
@@ -539,13 +539,13 @@ fn materialize_boot_snapshot(opts: &DaemonOpts) -> Result<String, String> {
                 );
                 run_via_cargo(&sim_args)?
             }
-            Err(e) => return Err(format!("failed to run koriscv: {e}")),
+            Err(e) => return Err(format!("failed to run emuko: {e}")),
         }
     } else {
         run_via_cargo(&sim_args)?
     };
     if !status.success() {
-        return Err("failed to build boot snapshot via koriscv".to_string());
+        return Err("failed to build boot snapshot via emuko".to_string());
     }
     Ok(out.display().to_string())
 }
@@ -743,7 +743,7 @@ fn list_snapshots(dir: &str) -> Result<String, String> {
         let entry = entry.map_err(|e| e.to_string())?;
         let name = entry.file_name();
         let name = name.to_string_lossy().to_string();
-        if name.contains(".kriscv") {
+        if name.contains(".emuko") {
             out.push(name);
         }
     }
@@ -907,7 +907,7 @@ fn handle_path(path: &str, st: &mut DaemonState) -> (u16, String, &'static str) 
     if path == "/v1/api/snap" {
         let _ = fs::create_dir_all(&st.snapshot_dir);
         let out = format!(
-            "{}/snap-{:020}.kriscv.zst",
+            "{}/snap-{:020}.emuko.zst",
             st.snapshot_dir,
             st.system.total_steps()
         );

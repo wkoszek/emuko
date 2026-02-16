@@ -1,5 +1,5 @@
 [package]
-name = "koriscv"
+name = "emuko"
 version = "0.1.0"
 edition = "2021"
 autobins = false
@@ -8,28 +8,28 @@ autobins = false
 zstd = "0.13"
 
 [[bin]]
-name = "koriscv"
+name = "emuko"
 path = "src/main.rs"
 
 [[bin]]
-name = "riscv_sim"
-path = "src/bin/riscv_sim.rs"
+name = "emuko-sim"
+path = "src/bin/emuko_sim.rs"
 
 [[bin]]
-name = "koriscvd"
-path = "src/bin/koriscvd.rs"
+name = "emukod"
+path = "src/bin/emukod.rs"
 
 [[bin]]
-name = "korisc"
-path = "src/bin/korisc.rs"
+name = "emuko-ctl"
+path = "src/bin/emuko_ctl.rs"
 
 [[bin]]
-name = "kor"
-path = "src/bin/kor.rs"
+name = "emu"
+path = "src/bin/emu.rs"
 
 [[bin]]
-name = "korjitdiff"
-path = "src/bin/korjitdiff.rs"
+name = "emuko-jitdiff"
+path = "src/bin/emuko_jitdiff.rs"
 
 [profile.release]
 codegen-units = 1

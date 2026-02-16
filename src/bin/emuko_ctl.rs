@@ -4,20 +4,20 @@ use std::net::TcpStream;
 
 fn print_usage_and_exit() -> ! {
     eprintln!("Usage:");
-    eprintln!("  kor start");
-    eprintln!("  kor stop");
-    eprintln!("  kor step [n]");
-    eprintln!("  kor dump");
-    eprintln!("  kor disas");
-    eprintln!("  kor con");
-    eprintln!("  kor restore <snapshot>");
-    eprintln!("  kor ls");
-    eprintln!("  kor snap");
-    eprintln!("  kor set <register> <value>");
-    eprintln!("  kor uart-inject <text>");
-    eprintln!("  kor uart-read [n]");
+    eprintln!("  emu start");
+    eprintln!("  emu stop");
+    eprintln!("  emu step [n]");
+    eprintln!("  emu dump");
+    eprintln!("  emu disas");
+    eprintln!("  emu con");
+    eprintln!("  emu restore <snapshot>");
+    eprintln!("  emu ls");
+    eprintln!("  emu snap");
+    eprintln!("  emu set <register> <value>");
+    eprintln!("  emu uart-inject <text>");
+    eprintln!("  emu uart-read [n]");
     eprintln!("Env:");
-    eprintln!("  KOR_ADDR=127.0.0.1:7788");
+    eprintln!("  EMUKO_ADDR=127.0.0.1:7788");
     std::process::exit(1);
 }
 
@@ -105,7 +105,7 @@ fn main() {
     let Some(cmd) = args.next() else {
         print_usage_and_exit();
     };
-    let addr = env::var("KOR_ADDR").unwrap_or_else(|_| "127.0.0.1:7788".to_string());
+    let addr = env::var("EMUKO_ADDR").unwrap_or_else(|_| "127.0.0.1:7788".to_string());
 
     let mut raw_output = false;
     let path = match cmd.as_str() {

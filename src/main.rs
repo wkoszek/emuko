@@ -24,7 +24,7 @@ use trap::Trap;
 
 fn print_usage() {
     eprintln!(
-        "Usage: koriscv <binary> [--steps N] [--load-addr ADDR] [--entry-addr ADDR] [--ram-base ADDR] [--ram-size BYTES] [--dtb FILE] [--dtb-addr ADDR] [--initrd FILE] [--initrd-addr ADDR] [--linux] [--ext EXT] [--bootargs STR] [--trace-traps N] [--trace-instr N] [--save-snapshot FILE] [--load-snapshot FILE] [--autosnapshot-every N] [--autosnapshot-dir DIR] [--perf-report-count N] [--perf-report-secs S] [--perf-check-ticks N] [--uart-poll-wall-ms N] [--uart-poll-calib-ms N] [--uart-poll-check-ticks N] [--uart-poll-ticks N] [--uart-flush-every N] [--no-dump]"
+        "Usage: emuko <binary> [--steps N] [--load-addr ADDR] [--entry-addr ADDR] [--ram-base ADDR] [--ram-size BYTES] [--dtb FILE] [--dtb-addr ADDR] [--initrd FILE] [--initrd-addr ADDR] [--linux] [--ext EXT] [--bootargs STR] [--trace-traps N] [--trace-instr N] [--save-snapshot FILE] [--load-snapshot FILE] [--autosnapshot-every N] [--autosnapshot-dir DIR] [--perf-report-count N] [--perf-report-secs S] [--perf-check-ticks N] [--uart-poll-wall-ms N] [--uart-poll-calib-ms N] [--uart-poll-check-ticks N] [--uart-poll-ticks N] [--uart-flush-every N] [--no-dump]"
     );
 }
 
@@ -79,7 +79,7 @@ fn run_with_autosnapshot(
         let ran = system.run(Some(chunk)).map_err(RunFailure::Trap)?;
         completed = completed.saturating_add(ran);
         let snap_path = format!(
-            "{}/snap-{:020}.kriscv.zst",
+            "{}/snap-{:020}.emuko.zst",
             autosnapshot_dir,
             system.total_steps()
         );
@@ -228,7 +228,7 @@ fn main() {
     let mut save_snapshot: Option<String> = None;
     let mut load_snapshot: Option<String> = None;
     let mut autosnapshot_every: Option<u64> = None;
-    let mut autosnapshot_dir: String = "/tmp/korisc5".to_string();
+    let mut autosnapshot_dir: String = "/tmp/emuko".to_string();
     let mut dump_state = true;
     let mut tuning = RuntimeTuning::default();
     while let Some(arg) = args.next() {

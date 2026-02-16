@@ -57,7 +57,7 @@ fn parse_u64(arg: &str) -> Option<u64> {
 
 fn print_usage_and_exit() -> ! {
     eprintln!(
-        "Usage: korjitdiff --snapshot FILE [--max-steps N] [--report-every N] [--jit-hot-threshold N] [--chunk-steps N]"
+        "Usage: emuko-jitdiff --snapshot FILE [--max-steps N] [--report-every N] [--jit-hot-threshold N] [--chunk-steps N]"
     );
     std::process::exit(1);
 }
