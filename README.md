@@ -15,6 +15,27 @@ Fast RISC-V emulator written in Rust. Boots Linux.
 - Peripherals: UART 16550, CLINT, PLIC, SBI 1.0, FDT generation
 - Single dependency (`zstd`), pure Rust
 
+## RISC-V Emulator Comparison (emuko vs others)
+
+This is a direct comparison with commonly used RISC-V emulators/simulators: **QEMU**, **Spike**, and **Renode**.
+
+| Area | emuko | QEMU (RISC-V `virt`) | Spike (`riscv-isa-sim`) | Renode |
+|------|-------|----------------------|--------------------------|--------|
+| Project focus | Fast Linux-capable RV64 emulator with tight debug/automation loop | General-purpose machine emulator/virtualizer | ISA functional simulator (reference-oriented) | System simulation framework for complex embedded setups |
+| Built-in control plane | HTTP API + WebSocket UART + CLI control (`start/stop/step/snap/uart-*`) | QMP (JSON protocol), monitor, GDB stub | CLI/ISA simulator workflow | Monitor + debugger/tool integrations (GDB/OpenOCD/Wireshark) |
+| Peripheral/platform breadth | Narrow, explicit set: RAM + UART16550 + CLINT + PLIC + SBI + FDT | Broad `virt` machine support (PCIe + `virtio-blk/net/gpu/rng`, etc.) | ISA-centric (not a broad board/peripheral platform model) | Broad platform modeling and co-sim/network scenarios |
+| Scale-out modeling | Current Linux boot path is single-hart (`System::new(1, ...)`) | SMP support (`-smp`) | Primarily ISA-level focus | Multi-node simulation focus |
+| What emuko has out of the box | `emuko dow` downloads Debian netboot assets with SHA256 verification; daemon reattach UX; UART inject/read commands; periodic autosnapshots | Typically assembled from monitor/QMP/scripts | Usually external tooling around simulator runs | Usually built from monitor scripts/integration workflows |
+| What others have that emuko currently lacks | N/A | Much wider device/board ecosystem and mature debugger ecosystem | Strong ISA-reference positioning | Rich multi-node and tooling integration surface |
+
+Sources:
+- QEMU RISC-V `virt` machine docs: <https://www.qemu.org/docs/master/system/riscv/virt.html>
+- QEMU GDB usage: <https://www.qemu.org/docs/master/system/gdb.html>
+- QEMU invocation (`-smp`): <https://www.qemu.org/docs/master/system/invocation.html>
+- QMP reference: <https://www.qemu.org/docs/master/interop/qmp-spec.html>
+- Spike README: <https://github.com/riscv-software-src/riscv-isa-sim>
+- Renode README: <https://github.com/renode/renode>
+
 ## Build
 
 ```
