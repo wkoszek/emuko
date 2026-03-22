@@ -1,6 +1,6 @@
 use std::env;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{Read, Write, IsTerminal};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -399,6 +399,9 @@ fn run_start(args: &[String], addr: &str) {
 }
 
 fn save_terminal() -> Option<String> {
+    if !std::io::stdin().is_terminal() {
+        return None;
+    }
     Command::new("stty")
         .args(["-g"])
         .output()
@@ -408,10 +411,16 @@ fn save_terminal() -> Option<String> {
 }
 
 fn set_raw_terminal() {
+    if !std::io::stdin().is_terminal() {
+        return;
+    }
     let _ = Command::new("stty").args(["raw", "-echo"]).status();
 }
 
 fn restore_terminal(saved: &str) {
+    if !std::io::stdin().is_terminal() {
+        return;
+    }
     let _ = Command::new("stty").arg(saved).status();
 }
 
