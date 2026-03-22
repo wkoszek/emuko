@@ -479,7 +479,10 @@ fn parse_opts() -> DaemonOpts {
     let dqib_dir = env::var("DQIB_DIR")
         .ok()
         .or_else(|| cfg.as_ref().and_then(|c| c.dqib_dir.clone()))
-        .unwrap_or_else(|| "/Users/wkoszek/Downloads/emuko/dqib_riscv64-virt".to_string());
+        .unwrap_or_else(|| {
+            let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+            format!("{}/.emuko/riscv64/dqib_riscv64-virt", home)
+        });
 
     let mut default_kernel = format!("{}/kernel", dqib_dir);
     let mut default_initrd = format!("{}/initrd", dqib_dir);

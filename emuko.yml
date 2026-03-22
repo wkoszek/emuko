@@ -14,13 +14,13 @@ kernel: ""
 initrd: ""
 
 # Asset discovery directories.
-debian_netboot_dir: artifacts/debian-netboot
-dqib_dir: /Users/wkoszek/Downloads/emuko/dqib_riscv64-virt
+debian_netboot_dir: ""
+dqib_dir: ""
 
 # Loader and guest boot config.
 load_addr: 0x80200000
 entry_addr: 0x80200000
-bootargs: "console=ttyS0,115200 earlycon=uart8250,mmio,0x10000000 rdinit=/bin/sh"
+bootargs: "console=ttyS0,115200 earlycon=uart8250,mmio,0x10000000 rdinit=/bin/sh noftrace ftrace=nop"
 # XXX: we need to figure out better user exp. for multiuser
 #bootargs: "console=ttyS0,115200 earlycon=uart8250,mmio,0x10000000"
 ram_mb: 1024
