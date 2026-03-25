@@ -15,6 +15,12 @@ Fast RISC-V emulator written in Rust. Boots Linux.
 - Peripherals: UART 16550, CLINT, PLIC, SBI 1.0, FDT generation
 - Single dependency (`zstd`), pure Rust
 
+## Note on speed
+
+Full disclosure: in interpreter mode this emulator is ~3 times slower than Qemu.
+In the JIT mode, it's ~29 times slower.
+We will get better performance once we implement code block chaining.
+
 ## RISC-V Emulator Comparison (emuko vs others)
 
 This is a direct comparison with commonly used RISC-V emulators/simulators: **QEMU**, **Spike**, and **Renode**.
