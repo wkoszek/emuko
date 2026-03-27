@@ -16,7 +16,7 @@ CC      := $(CROSS)gcc
 OBJDUMP := $(CROSS)objdump
 
 CFLAGS  := -march=rv64gc -mabi=lp64d -mcmodel=medany -O0 -std=c99 \
-           -ffreestanding -nostdlib -nostdinc \
+           -ffreestanding -nostdlib -nostdinc -fno-pic \
            -Wall -Wextra -Wno-main
 
 TARGET  := bare_printf.elf
