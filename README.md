@@ -112,6 +112,54 @@ emuko ls                   # list snapshots
 emuko restore <snapshot>   # restore a snapshot
 ```
 
+## Memory Map
+
+The emuko virtual machine uses a fixed MMIO layout compatible with the QEMU RISC-V `virt` platform.
+
+### Physical address space
+
+| Region | Base | Size | Description |
+|--------|------|------|-------------|
+| CLINT | `0x0200_0000` | 64 KiB | Core-local interruptor (timer + software IRQ) |
+| PLIC | `0x0C00_0000` | 4 MiB | Platform-level interrupt controller (32 sources) |
+| UART | `0x1000_0000` | 256 B | NS16550A serial console, IRQ 10 |
+| RAM | `0x8000_0000` | 1 GiB | General-purpose RAM (default, configurable) |
+
+For bare-metal programs: write a byte to `0x1000_0000` to emit a character on the UART console.
+
+### RAM layout (Linux boot)
+
+RAM is laid out dynamically at boot. With default settings (`load_addr=0x80200000`, 1 GiB RAM):
+
+```
+0x8000_0000  ──── RAM start
+                  (unused gap — available for bare-metal use)
+0x8020_0000  ──── Kernel image  (default load address)
+                  │  .text / .rodata / .data / .bss
+                  └─ kernel end (varies by image)
+                  (free space)
+             ──── initrd        (placed just below DTB)
+             ──── DTB           (placed just below EFI / RAM top)
+             ──── EFI region    (128 KiB, PE/UEFI kernels only)
+0xBFFF_FFFF  ──── RAM end
+```
+
+DTB, initrd, and EFI are placed from the top of RAM downward and must not overlap the kernel image. emukod checks for overlaps at boot and aborts with a clear error if RAM is too small.
+
+### RAM layout (bare-metal ELF)
+
+When you `emuko run ./my.elf` the ELF PT_LOAD segments are mapped at their `p_vaddr` addresses. The `examples/bare_printf` example links at `0x8000_0000`:
+
+```
+0x8000_0000  ──── .text  (_start → main)
+             ──── .rodata
+             ──── .data
+             ──── .bss   (zeroed by start.S)
+             ──── stack  (16 KiB, set up by start.S above BSS)
+```
+
+No DTB, initrd, or kernel is loaded. All registers start at zero except `sp` (set to `ram_base + 0x100000` by the emulator reset, overwritten by `start.S`).
+
 ## Configuration
 
 Pass options after `emuko start`, or set via environment variables or `emuko.yml`:
