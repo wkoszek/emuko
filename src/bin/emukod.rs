@@ -18,6 +18,8 @@ mod fdt;
 mod hart;
 #[path = "../isa.rs"]
 mod isa;
+#[path = "../elf.rs"]
+mod elf;
 #[path = "../pe.rs"]
 mod pe;
 #[path = "../plic.rs"]
@@ -1100,6 +1102,72 @@ fn handle_path(path: &str, st: &mut DaemonState) -> (u16, String, &'static str) 
     }
 }
 
+fn handle_post_path(
+    path: &str,
+    body: Vec<u8>,
+    st: &mut DaemonState,
+) -> (u16, String, &'static str) {
+    if path == "/v1/api/run-elf" {
+        let elf = match elf::parse_elf(&body) {
+            Ok(e) => e,
+            Err(e) => {
+                return (
+                    400,
+                    format!("{{\"error\":\"ELF parse failed: {}\" }}", e),
+                    "application/json",
+                );
+            }
+        };
+        st.running = false;
+        st.system.set_reset_pc(elf.entry);
+        st.system.reset();
+        for seg in &elf.segments {
+            if seg.filesz > 0 {
+                let end = seg.file_offset.saturating_add(seg.filesz).min(body.len());
+                if let Err(e) = st.system.load(seg.vaddr, &body[seg.file_offset..end]) {
+                    return (
+                        500,
+                        format!("{{\"error\":\"segment load failed: {:?}\"}}", e),
+                        "application/json",
+                    );
+                }
+            }
+            if seg.memsz > seg.filesz {
+                let bss_start = seg.vaddr + seg.filesz as u64;
+                let bss_len = seg.memsz - seg.filesz;
+                let zeros = vec![0u8; bss_len.min(1024 * 1024)];
+                let mut off = 0usize;
+                while off < bss_len {
+                    let chunk = (bss_len - off).min(zeros.len());
+                    if let Err(e) = st.system.load(bss_start + off as u64, &zeros[..chunk]) {
+                        return (
+                            500,
+                            format!("{{\"error\":\"BSS zero failed: {:?}\"}}", e),
+                            "application/json",
+                        );
+                    }
+                    off += chunk;
+                }
+            }
+        }
+        st.running = true;
+        return (
+            200,
+            format!(
+                "{{\"entry\":\"0x{:x}\",\"segments\":{}}}",
+                elf.entry,
+                elf.segments.len()
+            ),
+            "application/json",
+        );
+    }
+    (
+        404,
+        "{\"error\":\"unknown POST endpoint\"}".to_string(),
+        "application/json",
+    )
+}
+
 /// Returns Some(stream) if this was a WebSocket upgrade for UART; None for normal HTTP.
 fn handle_connection(mut stream: TcpStream, st: &mut DaemonState) -> Option<TcpStream> {
     let _ = stream.set_read_timeout(Some(Duration::from_millis(25)));
@@ -1139,6 +1207,43 @@ fn handle_connection(mut stream: TcpStream, st: &mut DaemonState) -> Option<TcpS
             }
         }
         write_http(stream, 400, "{\"error\":\"missing Sec-WebSocket-Key\"}", "application/json");
+        return None;
+    }
+
+    if method == "POST" {
+        let path = target.split('?').next().unwrap_or("/");
+        // Parse Content-Length from headers.
+        let content_length: usize = req.lines()
+            .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+            .and_then(|l| l.split_once(':'))
+            .and_then(|(_, v)| v.trim().parse().ok())
+            .unwrap_or(0);
+        const MAX_BODY: usize = 64 * 1024 * 1024;
+        if content_length > MAX_BODY {
+            write_http(stream, 400, "{\"error\":\"body too large\"}", "application/json");
+            return None;
+        }
+        // Collect body: bytes already in the buffer after the header separator.
+        let header_end = match req.find("\r\n\r\n") {
+            Some(i) => i + 4,
+            None => {
+                write_http(stream, 400, "{\"error\":\"bad request\"}", "application/json");
+                return None;
+            }
+        };
+        let already = &buf[header_end..n];
+        let mut post_body: Vec<u8> = already.to_vec();
+        post_body.reserve(content_length.saturating_sub(already.len()));
+        while post_body.len() < content_length {
+            let mut chunk = [0u8; 8192];
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(k) => post_body.extend_from_slice(&chunk[..k]),
+                Err(_) => break,
+            }
+        }
+        let (code, resp_body, ctype) = handle_post_path(path, post_body, st);
+        write_http(stream, code, &resp_body, ctype);
         return None;
     }
 
@@ -1931,7 +2036,12 @@ fn run_standalone() {
     };
 
     let pe_image = pe::parse_pe(&data).ok();
-    if pe_image.is_none() && data.len() > ram_size {
+    let elf_image = if pe_image.is_none() {
+        elf::parse_elf(&data).ok()
+    } else {
+        None
+    };
+    if pe_image.is_none() && elf_image.is_none() && data.len() > ram_size {
         eprintln!(
             "Program too large: {} bytes (ram {} bytes)",
             data.len(),
@@ -1978,6 +2088,17 @@ fn run_standalone() {
         load_addr = load_addr_arg.unwrap_or(preferred);
         image_size = pe.size_of_image as u64;
         entry_addr_default = load_addr + pe.entry_rva as u64;
+    } else if let Some(elf) = &elf_image {
+        eprintln!(
+            "ELF: entry=0x{:x} segments={} mem_base=0x{:x} mem_size=0x{:x}",
+            elf.entry,
+            elf.segments.len(),
+            elf.mem_base(),
+            elf.mem_size(),
+        );
+        load_addr = load_addr_arg.unwrap_or(elf.mem_base());
+        image_size = elf.mem_size();
+        entry_addr_default = elf.entry;
     }
     if load_addr < ram_base || load_addr + image_size > ram_base + ram_size as u64 {
         eprintln!(
@@ -2046,6 +2167,34 @@ fn run_standalone() {
                 }
                 if !load_ok {
                     break;
+                }
+            }
+        }
+    } else if let Some(elf) = &elf_image {
+        'elf_load: for seg in &elf.segments {
+            if seg.filesz > 0 {
+                let end = seg.file_offset.saturating_add(seg.filesz).min(data.len());
+                if let Err(e) = system.load(seg.vaddr, &data[seg.file_offset..end]) {
+                    eprintln!("ELF segment load at 0x{:x} failed: {:?}", seg.vaddr, e);
+                    load_ok = false;
+                    break;
+                }
+            }
+            if seg.memsz > seg.filesz {
+                let bss_start = seg.vaddr + seg.filesz as u64;
+                let bss_len = seg.memsz - seg.filesz;
+                let zeros = vec![0u8; bss_len.min(1024 * 1024)];
+                let mut offset = 0usize;
+                while offset < bss_len {
+                    let chunk = (bss_len - offset).min(zeros.len());
+                    if let Err(e) =
+                        system.load(bss_start + offset as u64, &zeros[..chunk])
+                    {
+                        eprintln!("ELF BSS zero at 0x{:x} failed: {:?}", bss_start, e);
+                        load_ok = false;
+                        break 'elf_load;
+                    }
+                    offset += chunk;
                 }
             }
         }
