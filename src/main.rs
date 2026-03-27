@@ -68,6 +68,30 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
+fn http_post(addr: &str, path: &str, body: &[u8]) -> Result<(u16, String), String> {
+    let mut stream = TcpStream::connect(addr).map_err(|e| e.to_string())?;
+    let header = format!(
+        "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
+        path, addr, body.len()
+    );
+    stream.write_all(header.as_bytes()).map_err(|e| e.to_string())?;
+    stream.write_all(body).map_err(|e| e.to_string())?;
+    stream.flush().map_err(|e| e.to_string())?;
+    let mut bytes = Vec::new();
+    stream.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+    let text = String::from_utf8_lossy(&bytes);
+    let mut sections = text.splitn(2, "\r\n\r\n");
+    let head = sections.next().unwrap_or_default();
+    let body_str = sections.next().unwrap_or_default().to_string();
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(500);
+    Ok((status, body_str))
+}
+
 fn http_get(addr: &str, path: &str) -> Result<(u16, String), String> {
     let mut stream = TcpStream::connect(addr).map_err(|e| e.to_string())?;
     let req = format!(
@@ -736,6 +760,7 @@ fn print_usage() {
     eprintln!();
     eprintln!("Commands:");
     eprintln!("  dow [set-name]            Download kernel/initrd from registry");
+    eprintln!("  run <elf>                 Upload RISC-V ELF to daemon and run it bare-metal");
     eprintln!("  start [emukod-args...]    Start daemon + attach console (Ctrl+] to detach)");
     eprintln!("  stop                      Stop (pause) the emulator");
     eprintln!("  kill                      Shut down the daemon");
@@ -771,6 +796,31 @@ fn main() {
     if cmd == "start" {
         let remaining: Vec<String> = args.collect();
         run_start(&remaining, &addr);
+        return;
+    }
+
+    if cmd == "run" {
+        let path = args.next().unwrap_or_else(|| {
+            eprintln!("Usage: emuko run <elf-file>");
+            std::process::exit(1);
+        });
+        let data = fs::read(&path).unwrap_or_else(|e| {
+            eprintln!("Cannot read {}: {}", path, e);
+            std::process::exit(1);
+        });
+        eprintln!("Uploading {} ({} bytes)...", path, data.len());
+        match http_post(&addr, "/v1/api/run-elf", &data) {
+            Ok((200, _)) => eprintln!("Running. Attaching console (Ctrl+] to detach)."),
+            Ok((code, body)) => {
+                eprintln!("Server error {}: {}", code, body);
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("Failed to reach daemon at {}: {}", addr, e);
+                std::process::exit(1);
+            }
+        }
+        run_console(&addr);
         return;
     }
 
