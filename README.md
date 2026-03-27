@@ -10,6 +10,7 @@ Fast RISC-V emulator written in Rust. Boots Linux.
 - **JIT compilation** for ARM64 and x86_64 hosts (adaptive selection)
 - **Full Linux boot** with BusyBox userland and interactive shell
 - **Snapshot/restore** for saving and resuming full machine state
+- **Bare-metal ELF execution** — upload any RISC-V ELF to the running daemon and run it without a kernel or OS
 - **Daemon mode** with HTTP API and live UART command injection
 - **Differential checker** to validate JIT against interpreter
 - Peripherals: UART 16550, CLINT, PLIC, SBI 1.0, FDT generation
@@ -35,6 +36,7 @@ Legend: `✅` = built in / directly documented, `—` = not built in (or not doc
 | HTTP API for machine control | ✅ | — | — | — |
 | WebSocket UART console endpoint | ✅ | — | — | — |
 | Scriptable UART host bridge primitives | ✅ | — | — | ✅ |
+| Bare-metal ELF upload and execution (no kernel/OS) | ✅ | — | — | — |
 | One-command Debian kernel/initrd download with SHA256 verification | ✅ | — | — | — |
 | Built-in JIT-vs-interpreter differential checker | ✅ | — | — | — |
 | GDB debugging workflow | — | ✅ | ✅ | ✅ |
@@ -101,6 +103,32 @@ emuko kill             # shut down daemon
 ```
 
 The daemon exposes an HTTP API at `http://127.0.0.1:7788/v1/api/` and a WebSocket console at `ws://127.0.0.1:7788/v1/ws/uart`.
+
+### Running bare-metal RISC-V ELF binaries
+
+You can upload any RISC-V ELF binary directly to the running daemon. The daemon resets the machine, loads the ELF segments at their specified virtual addresses, and starts execution — no kernel, no initrd, no OS.
+
+```
+emuko run ./my_program.elf
+```
+
+The binary's output appears over the same UART WebSocket console. The daemon must already be running (`emuko start`).
+
+#### Examples
+
+The [`examples/`](examples/) directory contains ready-to-build bare-metal programs:
+
+| Example | Description |
+|---------|-------------|
+| [`bare_printf`](examples/bare_printf/) | Hello World — prints a message every 10 million loop iterations, direct UART write, no libc |
+
+To build and run an example (requires a RISC-V cross-compiler — `brew install riscv64-elf-gcc` on macOS or `apt install gcc-riscv64-linux-gnu` on Linux):
+
+```
+emuko start                        # start the daemon in one terminal
+cd examples/bare_printf
+make run                           # builds the ELF, uploads it, attaches console
+```
 
 ### Snapshots
 
