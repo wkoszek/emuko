@@ -256,8 +256,34 @@ fn download_file(url: &str, dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
+const REGISTRY_URL: &str =
+    "https://raw.githubusercontent.com/wkoszek/emuko/main/registry.json";
+
+fn fetch_url_to_string(url: &str) -> Option<String> {
+    ureq::get(url)
+        .call()
+        .ok()?
+        .body_mut()
+        .read_to_string()
+        .ok()
+}
+
+fn load_registry_json() -> String {
+    // 1. Try fetching the live registry from GitHub (always up-to-date).
+    if let Some(contents) = fetch_url_to_string(REGISTRY_URL) {
+        if !contents.trim().is_empty() {
+            eprintln!("  registry: {} (live)", REGISTRY_URL);
+            return contents;
+        }
+    }
+    // 2. Fall back to the version embedded at compile time.
+    eprintln!("  registry: built-in (network unavailable)");
+    REGISTRY_JSON.to_string()
+}
+
 fn run_dow(filter: Option<&str>) {
-    let sets = parse_registry(REGISTRY_JSON);
+    let registry = load_registry_json();
+    let sets = parse_registry(&registry);
     if sets.is_empty() {
         eprintln!("No download sets found in registry.");
         std::process::exit(1);

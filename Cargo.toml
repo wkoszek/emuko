@@ -6,6 +6,7 @@ autobins = false
 
 [dependencies]
 zstd = "0.13"
+ureq = "3"
 
 [[bin]]
 name = "emuko"
