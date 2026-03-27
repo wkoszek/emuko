@@ -4,16 +4,16 @@
       "arch": "riscv64",
       "files": [
         {
-          "url": "http://ftp.debian.org/debian/dists/sid/main/installer-riscv64/20250515/images/netboot/debian-installer/riscv64/linux",
+          "url": "https://deb.debian.org/debian/dists/trixie/main/installer-riscv64/current/images/netboot/debian-installer/riscv64/linux",
           "save_as": "linux",
-          "sha256": "96e1b958e73e3fa82cc0d6e7e5f39861e89b855ca9ed5716ad75f3665b042497",
-          "size": 31158272
+          "sha256": "753fa1d09ed92cc6bd4238edb7f91a36c12460fcc73309ec6ac0c23634358d64",
+          "size": 31172096
         },
         {
-          "url": "http://ftp.debian.org/debian/dists/sid/main/installer-riscv64/20250515/images/netboot/debian-installer/riscv64/initrd.gz",
+          "url": "https://deb.debian.org/debian/dists/trixie/main/installer-riscv64/current/images/netboot/debian-installer/riscv64/initrd.gz",
           "save_as": "initrd.gz",
-          "sha256": "b648b61bca7cdf1c12a0a2e00f1ab52e18f32375912ec2ea9ced1663375b9ffa",
-          "size": 43424822
+          "sha256": "2922e7fbf4f474b15666804525b3d785e6f62be37326b16123caa764bb10aba1",
+          "size": 43352083
         }
       ]
     }
