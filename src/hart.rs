@@ -14,12 +14,12 @@ use std::collections::{HashMap, HashSet};
 mod cache_mmu;
 #[path = "hart/decode.rs"]
 mod decode;
-#[path = "hart/exec_core.rs"]
-mod exec_core;
-#[path = "hart/jit_a64.rs"]
-mod jit_a64;
-#[path = "hart/jit_x64.rs"]
-mod jit_x64;
+#[path = "hart/interp.rs"]
+mod interp;
+#[path = "hart/jit_arm64.rs"]
+mod jit_arm64;
+#[path = "hart/jit_amd64.rs"]
+mod jit_amd64;
 #[path = "hart/memory.rs"]
 mod memory;
 #[path = "hart/state.rs"]
